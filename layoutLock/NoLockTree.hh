@@ -6,7 +6,7 @@
  */
 #pragma once
 
-#include "Tree.hpp"
+#include "Tree.hh"
 #include <string>
 #include <iostream>
 #include <vector>
@@ -209,7 +209,7 @@ public:
 	}
 };
 
-class NoLockTree: public tree{
+class NoLockTree: public Tree{
 public:
 	NoLockHelper helper;
 	bool search(unsigned key){
@@ -230,8 +230,6 @@ class searchOnlyTree: public NoLockTree{
 	virtual bool insert(unsigned key){return search(key);}
 	virtual std::string name(){return "searchOnly"; }
 };
-
-#endif /* TREE1_HPP_ */
 
 /*
 	node *getNewNode(unsigned key){

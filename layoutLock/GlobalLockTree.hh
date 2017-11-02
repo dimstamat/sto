@@ -22,6 +22,9 @@ using std::set;
 #define INVALID_KEY_SMALL 0
 #define INVALID_KEY_LARGE (~0u)
 
+#ifndef SYNC
+#define SYNC(S) S
+#endif
 
 class GlobalLockTree{
 public:
