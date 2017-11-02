@@ -2,8 +2,24 @@
 #include "Interface.hh"
 #include "TWrapped.hh"
 // layout tree includes
-#include "tree.hpp"
-#include "GlobalLockTree.hh"
+#include "layoutLock/Tree.hh"
+#include "layoutLock/GlobalLockTree.hh"
+#include "layoutLock/llock.hh"
+
+#define SYNC(S) S
+#define CHCK(S)
+
+#define NO_ASM_SEARCH
+
+#ifndef RWLOCK
+typedef LayoutLock_DefaultImpl_<ScalableRWLock<64>> Layout_Lock;
+#else
+typedef LayoutRWLOCK Layout_Lock;
+#endif
+
+enum NODE_TYPES {NORMAL_NODE=0XDE, DATA_NODE_T=1};
+#define NOINLINE __attribute__((noinline))
+extern GlobalLockTree NULL_TREE;
 
 
 /* 
@@ -21,8 +37,6 @@ public:
  	 * layout tree members
  	 * ----------------------
     */
-	extern globalLockTree NULL_TREE;
-	enum NODE_TYPES {NORMAL_NODE=0XDE, DATA_NODE_T=1};
 	struct cacheKeys{
         union{
             unsigned type;
@@ -48,7 +62,7 @@ public:
 
 	// initialize the layout tree by constructing the backbone
 	TLayoutBT(){
-	
+		head = build(16, 0);
 	}
 
 	/* ---------------------
@@ -83,6 +97,16 @@ public:
         return n;
     }
 
+	int size(node *root){
+        if(root->keys.type!=NORMAL_NODE)
+            return ((GlobalLockTree*)root)->size();
+        int sum=0;
+        for(int c=0; c<16; ++c)
+            sum+=size(root->next[c]);
+        return sum;
+    }
+
+
 
 
 	bool lock(TransItem& item, Transaction& txn){
@@ -100,4 +124,4 @@ public:
 	void unlock(TransItem& item){
 	
 	}
-}
+};
