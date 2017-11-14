@@ -1,127 +1,153 @@
 #pragma once
 #include "Interface.hh"
 #include "TWrapped.hh"
-// layout tree includes
-#include "layoutLock/Tree.hh"
-#include "layoutLock/GlobalLockTree.hh"
-#include "layoutLock/llock.hh"
-
-#define SYNC(S) S
-#define CHCK(S)
-
-#define NO_ASM_SEARCH
-
-#ifndef RWLOCK
-typedef LayoutLock_DefaultImpl_<ScalableRWLock<64>> Layout_Lock;
-#else
-typedef LayoutRWLOCK Layout_Lock;
-#endif
-
-enum NODE_TYPES {NORMAL_NODE=0XDE, DATA_NODE_T=1};
-#define NOINLINE __attribute__((noinline))
-extern GlobalLockTree NULL_TREE;
-
+#include "layoutLock/LayoutTree.hh"
 
 /* 
- *  A transactional version of the cohen DLtree running on top of STO
- *  Initialization will be non-transactional on tree construction time
- *  ------------------------------------------------------------------
- *  Author: Dimokritos Stamatakis
- *  Nov 1 2017
+ *    A transactional version of the cohen DLtree running on top of STO
+ *    Initialization will be non-transactional on tree construction time
+ *    ------------------------------------------------------------------
+ *    Author: Dimokritos Stamatakis
+ *    Nov 1 2017
  */
 
+
+// This version uses a pessimistick lock for each treelet.
+// The optimistic version will either:
+// a: 	record all treelet modifications in the tracking
+// 		set, just like the STO protocol, or
+// b:	apply the modifications right away, since there is a
+// 		lock held for each treelet
 template<typename T, typename W = TWrapped<T> >
-class TLayoutBT: public TObject {
-public:
-	/* ---------------------
- 	 * layout tree members
- 	 * ----------------------
-    */
-	struct cacheKeys{
-        union{
-            unsigned type;
-            unsigned dummyKeys[];//keys starts at 1.
-        };
-        unsigned keys[15];
-    } __attribute__ ((aligned (64)));
-    struct node{
-        cacheKeys keys;
-        struct node *next[16];
-        node(){memset(this, 0, sizeof(struct node)); keys.type=NORMAL_NODE;}
-    }__attribute__ ((aligned(64)));
-    struct datanode{
-        unsigned type;
-        unsigned key;
-        void *data;
-        datanode(unsigned key, void *data){
-            this->key=key; this->data=data; this->type=DATA_NODE_T;
-        }
-    };
-    node *head;
-
-
-	// initialize the layout tree by constructing the backbone
-	TLayoutBT(){
-		head = build(16, 0);
-	}
-
-	/* ---------------------
- 	 * layout tree functions
- 	 * ----------------------
-	 */
-	// build the backbone from start
-    node *build(int level, long first){
-        if(level==0){
-            std::vector<unsigned> v(1);
-            v[0]=first;
-            return (node*)new GlobalLockTree(v.begin(),v.end());
-        }
-        int delta = 1<<(level-0);
-        node *n = new node();
-        for(int l=0; l<4; ++l, delta/=2){
-            for(int i=0; i<(1<<l); ++i){
-                n->keys.keys[(1<<l)-1+i] = first+(i*2+1)*delta;
-            }
-        }
-        assert((level%4) == 0 && level>0);
-        if(level>4)
-        {
-            for(int i=0; i<16; ++i)
-                n->next[i]=build(level-4, first+(2*i)*delta);
-        }
-        else{
-            for(int i=0; i<16; ++i){
-                n->next[i]=build(0, first+2*(i+1)*delta);
-            }
-        }
-        return n;
-    }
-
-	int size(node *root){
-        if(root->keys.type!=NORMAL_NODE)
-            return ((GlobalLockTree*)root)->size();
-        int sum=0;
-        for(int c=0; c<16; ++c)
-            sum+=size(root->next[c]);
-        return sum;
-    }
-
-
-
-
-	bool lock(TransItem& item, Transaction& txn){
-		return false;
-	}
-
-	bool check(TransItem& item, Transaction& txn){
-		return false;
-	}
-
-    void install(TransItem& item, Transaction& txn){
-		
-	}
-
-	void unlock(TransItem& item){
+class TLayoutBT: public LayoutTree, public TObject {
+	map<T, GlobalLockTree*> treelets [MAX_THREADS];
 	
+	inline GlobalLockTree* treelet_map_get(T key){
+        int id = TThread::id();
+        assert(id >=0 && id < MAX_THREADS);
+        map<T, GlobalLockTree*> &myTreelets = treelets[id];
+		// no need to search, we already have pointer to the
+		// desired treelet within the current thread!
+        if(myTreelets.find(key) != myTreelets.end())
+            return myTreelets[key];
+        else
+            return nullptr;
+    }
+
+	inline void treelet_map_put(T key, GlobalLockTree* treelet){
+		int id = TThread::id();
+        assert(id >=0 && id < MAX_THREADS);
+        map<T, GlobalLockTree*> &myTreelets = treelets[id];
+		myTreelets[key] = treelet;
 	}
+
+	// When we have transactions, a treelet lock will not be released
+	// until the transaction commits. Thus, we must maintain pointers to
+	// all treelets used for this transaction. This means that
+	// getTreelet will first look in the data structure holding the treelet pointers
+	// before searching in the backbone.
+    GlobalLockTree* getTreelet(T key, dptrtype *dirtyP){
+		GlobalLockTree * t;
+        if(( t = treelet_map_get(key)) != nullptr)
+        	return t;
+        SYNC(start: llock_.startRead();)
+        node *cur = head;
+        while(cur->keys.type==NORMAL_NODE){
+            unsigned idx = asmsearch(key, (unsigned *)cur);
+            cur = cur->next[idx-16];
+            //assert(cur!=NULL);
+        }
+        t = (GlobalLockTree*)cur;
+        t->acquire();
+#ifndef NOSYNC
+        if(llock_.finishRead(dirtyP)==false){
+            t->release();
+            goto start;
+        }
+#endif
+		treelet_map_put(key, t);
+        return t;
+    }
+
+
+	public:
+
+	TLayoutBT(){}
+
+	bool insert(T key, dptrtype *dirtyP){
+      CHCK(int n = __atomic_fetch_add(&next, 1, __ATOMIC_SEQ_CST);\
+      buffer[n] = key;)
+        bool insres;
+		GlobalLockTree * t;
+		t = getTreelet(key, dirtyP);
+		Sto::item(this, t).add_write(key);
+        // will to the actual insert in install phase!
+		//insres = t->insert(key);
+        insres = true;
+		if(unlikely((heuristic[stateOff_]+=insres)>=200))
+        {
+            int res = __sync_add_and_fetch(&fuzzySize, heuristic[stateOff_]);
+            //printf("fuzzySize=%d, th=%d\n", tid_, res);
+			int lenlargeWhen;
+            SYNC(lb: llock_.startRead();) lenlargeWhen=enlargeWhen; SYNC(if(llock_.finishRead()==false) goto lb;)
+            if(res >= lenlargeWhen) enlarge_tree(res);
+            heuristic[stateOff_]=0;
+        }
+		treelet_map_put(key, t);
+		return insres;
+	}
+
+	bool remove(T key, dptrtype *dirtyP){
+        bool res;//, shrink=false;
+		GlobalLockTree * t;
+        t = getTreelet(key, dirtyP);
+		auto item = Sto::item(this, t).add_write(key);
+		item.add_flags(TransItem::user0_bit); // specify it is a remove operation
+		res = true;
+		//res = t->remove(key);
+        if(unlikely((heuristic[stateOff_]-=res)<-200))
+      	{
+         	int res = __sync_add_and_fetch(&fuzzySize, heuristic[stateOff_]);
+            int lshrinkWhen;
+         	SYNC(lb: llock_.startRead();) lshrinkWhen=shrinkWhen; SYNC(if(llock_.finishRead()==false) goto lb;)
+         	if(res <= lshrinkWhen) shrink_tree(res);
+		 	//printf("REMOVE: fuzzySize=%d, th=%d\n", res, tid_);
+         	heuristic[stateOff_]=0;
+      	}
+		treelet_map_put(key, t);
+        return res;
+    }
+
+
+	/* STO callbacks
+ 	 * -------------
+ 	 */
+	// pessimistic approach locks every treelet before accessing it,
+	// thus we don't need to lock at commit time
+    bool lock(TransItem&, Transaction&){
+        return true;
+    }
+	// there is no tracking set check required
+    bool check(TransItem&, Transaction&){
+        return true;
+    }
+	// modifications will be performed
+    void install(TransItem& item, Transaction& txn){
+		GlobalLockTree* t = item.key<GlobalLockTree*>();
+		bool res;
+		// check whether it is an insert or delete
+		if(item.flags() & TransItem::user0_bit) { // delete
+    		res = t->remove(item.write_value<T>());
+		}
+		else { // insert
+			res = t->insert(item.write_value<T>());
+		}
+		// if (!res)
+		// txn->abort();
+	}
+
+    void unlock(TransItem&){
+
+    }
+
 };
