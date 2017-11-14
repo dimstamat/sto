@@ -77,9 +77,6 @@ public:
 	int enlargeWhen=16, shrinkWhen=-1, backboneSize=0;
 	int heuristic[PADDING(int)*64]={0};
 
-	// Dimos
-	// maintain all treelets used by current transaction
-	map<unsigned,GlobalLockTree*> treelets;
 	node *buildSing(unsigned val){
 		datanode *n=new datanode(val, NULL);
 		return (node *)n;
@@ -165,12 +162,6 @@ public:
 		return (GlobalLockTree*) cur;
 	}
 
-	// Dimos
-	// When we have transactions, a treelet lock will not be released
-	// until the transaction commits. Thus, we must maintain pointers to
-	// all treelets used for this transaction. This means that
-	// getTreelet will first look in the data structure holding the treelet pointers
-	// before searching in the backbone.
 	GlobalLockTree *getTreelet(unsigned key, dptrtype *dirtyP){
 		SYNC(start: llock_.startRead();)
 		node *cur = head;
