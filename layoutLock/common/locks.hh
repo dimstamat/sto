@@ -42,7 +42,7 @@
 #define LOCKED 0xABD
 #define UNLOCKED 0xABC
 
-#include "platform.hpp"
+#include "platform.hh"
 
 /**
  *  This is a bit ugly... the bet backoff parameters for SPARC and x86 differ.
