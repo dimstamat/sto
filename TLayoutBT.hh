@@ -12,6 +12,10 @@
  */
 
 
+using namespace std;
+
+// tracking set will be <GlobalLockTree*, treelet_log*>
+
 // This version uses a pessimistick lock for each treelet.
 // The optimistic version will either:
 // a: 	record all treelet modifications in the tracking
@@ -20,27 +24,8 @@
 // 		lock held for each treelet
 template<typename T, typename W = TWrapped<T> >
 class TLayoutBT: public LayoutTree, public TObject {
-	map<T, GlobalLockTree*> treelets [MAX_THREADS];
+	std::map<T, bool> treelet_log;
 	
-	inline GlobalLockTree* treelet_map_get(T key){
-        int id = TThread::id();
-        assert(id >=0 && id < MAX_THREADS);
-        map<T, GlobalLockTree*> &myTreelets = treelets[id];
-		// no need to search, we already have pointer to the
-		// desired treelet within the current thread!
-        if(myTreelets.find(key) != myTreelets.end())
-            return myTreelets[key];
-        else
-            return nullptr;
-    }
-
-	inline void treelet_map_put(T key, GlobalLockTree* treelet){
-		int id = TThread::id();
-        assert(id >=0 && id < MAX_THREADS);
-        map<T, GlobalLockTree*> &myTreelets = treelets[id];
-		myTreelets[key] = treelet;
-	}
-
 	// When we have transactions, a treelet lock will not be released
 	// until the transaction commits. Thus, we must maintain pointers to
 	// all treelets used for this transaction. This means that
@@ -48,8 +33,6 @@ class TLayoutBT: public LayoutTree, public TObject {
 	// before searching in the backbone.
     GlobalLockTree* getTreelet(T key, dptrtype *dirtyP){
 		GlobalLockTree * t;
-        if(( t = treelet_map_get(key)) != nullptr)
-        	return t;
         SYNC(start: llock_.startRead();)
         node *cur = head;
         while(cur->keys.type==NORMAL_NODE){
@@ -58,14 +41,17 @@ class TLayoutBT: public LayoutTree, public TObject {
             //assert(cur!=NULL);
         }
         t = (GlobalLockTree*)cur;
-        t->acquire();
+		auto item = Sto::item(this, t);
+		// only acquire the lock if tracking set is empty!
+		if (! item.has_write() && ! item.has_read()){
+			t->acquire();
+		}
 #ifndef NOSYNC
         if(llock_.finishRead(dirtyP)==false){
             t->release();
             goto start;
         }
 #endif
-		treelet_map_put(key, t);
         return t;
     }
 
@@ -80,8 +66,17 @@ class TLayoutBT: public LayoutTree, public TObject {
         bool insres;
 		GlobalLockTree * t;
 		t = getTreelet(key, dirtyP);
-		Sto::item(this, t).add_write(key);
-        // will to the actual insert in install phase!
+		std::map<T, bool> * treelet_log;
+		auto item = Sto::item(this, t);
+		if (item.has_write()){
+			treelet_log = item.template write_value<std::map<T,bool>* >();
+		}
+		else {
+        	treelet_log = new std::map<T, bool>();
+			item.add_write(*treelet_log);
+		}
+		(*treelet_log)[key] = true;
+        // will do the actual insert in install phase!
 		//insres = t->insert(key);
         insres = true;
 		if(unlikely((heuristic[stateOff_]+=insres)>=200))
@@ -93,7 +88,6 @@ class TLayoutBT: public LayoutTree, public TObject {
             if(res >= lenlargeWhen) enlarge_tree(res);
             heuristic[stateOff_]=0;
         }
-		treelet_map_put(key, t);
 		return insres;
 	}
 
@@ -101,8 +95,17 @@ class TLayoutBT: public LayoutTree, public TObject {
         bool res;//, shrink=false;
 		GlobalLockTree * t;
         t = getTreelet(key, dirtyP);
-		auto item = Sto::item(this, t).add_write(key);
-		item.add_flags(TransItem::user0_bit); // specify it is a remove operation
+		std::map<T, bool> * treelet_log;
+        auto item = Sto::item(this, t);
+        if (item.has_write()){
+			treelet_log = item.template write_value<std::map<T,bool> *>();
+        }
+		else {
+			treelet_log = new std::map<T, bool>();
+            item.add_write(*treelet_log);
+		}
+        (*treelet_log)[key] = false;
+		//item.add_flags(TransItem::user0_bit); // specify it is a remove operation : No need now! We specify it at the boolean value of the treelet_log map
 		res = true;
 		//res = t->remove(key);
         if(unlikely((heuristic[stateOff_]-=res)<-200))
@@ -114,7 +117,6 @@ class TLayoutBT: public LayoutTree, public TObject {
 		 	//printf("REMOVE: fuzzySize=%d, th=%d\n", res, tid_);
          	heuristic[stateOff_]=0;
       	}
-		treelet_map_put(key, t);
         return res;
     }
 
@@ -131,16 +133,18 @@ class TLayoutBT: public LayoutTree, public TObject {
     bool check(TransItem&, Transaction&){
         return true;
     }
-	// modifications will be performed
+	// modifications will be applied now
     void install(TransItem& item, Transaction& txn){
 		GlobalLockTree* t = item.key<GlobalLockTree*>();
 		bool res;
-		// check whether it is an insert or delete
-		if(item.flags() & TransItem::user0_bit) { // delete
-    		res = t->remove(item.write_value<T>());
-		}
-		else { // insert
-			res = t->insert(item.write_value<T>());
+		std::map<T, bool>* treelet_log = item.template write_value<std::map<T, bool>*>();
+		for (const auto& log_entry: *treelet_log){
+			if(log_entry.second){
+				t->insert(log_entry.first);
+			}
+			else{
+				t->remove(log_entry.first);
+			}
 		}
 		// if (!res)
 		// txn->abort();
