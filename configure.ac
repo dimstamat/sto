@@ -454,4 +454,13 @@ AC_ARG_WITH([masstree],
     [MASSTREEDIR="$withval"], [MASSTREEDIR=masstree-beta])
 AC_SUBST(MASSTREEDIR)
 
+
+AC_ARG_WITH([art],
+    [AS_HELP_STRING([--with-art=DIR],
+                    [ART directory [ARTSynchronized]])],
+    [ARTDIR="$withval"], [ARTDIR=ARTSynchronized])
+AC_SUBST(ARTDIR)
+
+
+
 AC_OUTPUT
