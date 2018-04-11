@@ -4,13 +4,14 @@
 AR = ar
 CC = @CC@
 CXX = @CXX@
-CPPFLAGS = -I$(MASSTREEDIR)
+CPPFLAGS = -I$(MASSTREEDIR) -I$(ARTDIR)
 DEPSDIR := .deps
 DEPCFLAGS = -MD -MF $(DEPSDIR)/$*.d -MP
-LIBS = @LIBS@ $(MASSTREEDIR)/libjson.a -lpthread -lm
+LIBS = @LIBS@ $(MASSTREEDIR)/libjson.a $(ARTDIR)/build/libARTSynchronized.a -lpthread -lm
 LIBOBJS = @LIBOBJS@
 LDFLAGS = @LDFLAGS@
 MASSTREEDIR = @MASSTREEDIR@
+ARTDIR = @ARTDIR@
 
 # if CXXFLAGS changes, rebuild
 ifndef CXXFLAGS
@@ -79,7 +80,7 @@ OPTFLAGS += -g -pg -fno-inline
 endif
 
 PROGRAMS = concurrent singleelems list1 vector pqueue rbtree trans_test ht_mt pqVsIt iterators single predicates ex-counter $(UNIT_PROGRAMS)
-UNIT_PROGRAMS = unit-tarray unit-tintpredicate unit-tcounter unit-tbox unit-tgeneric unit-rcu unit-tvector unit-tvector-nopred unit-mbta unit-sampling unit-opacity unit-tlayout-bt
+UNIT_PROGRAMS = unit-tarray unit-tintpredicate unit-tcounter unit-tbox unit-tgeneric unit-rcu unit-tvector unit-tvector-nopred unit-mbta unit-sampling unit-opacity unit-tlayout-bt unit-tart
 
 all: $(PROGRAMS)
 
@@ -146,6 +147,9 @@ unit-tbox: unit-tbox.o $(STO_DEPS)
 	$(CXX) $(CXXFLAGS) $(OPTFLAGS) -o $@ $< $(STO_OBJS) $(LDFLAGS) $(LIBS)
 
 unit-tlayout-bt: unit-tlayout-bt.o $(STO_DEPS)
+	$(CXX) $(CXXFLAGS) $(OPTFLAGS) -o $@ $< $(STO_OBJS) $(LDFLAGS) $(LIBS)
+
+unit-tart:	unit-tart.o $(STO_DEPS)
 	$(CXX) $(CXXFLAGS) $(OPTFLAGS) -o $@ $< $(STO_OBJS) $(LDFLAGS) $(LIBS)
 
 unit-tgeneric: unit-tgeneric.o $(STO_DEPS)
