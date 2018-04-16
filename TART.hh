@@ -13,6 +13,16 @@
  */
 
 
+using namespace std;
+#include <iostream>
+
+#define DEBUG 1
+#if DEBUG == 1
+    #define PRINT_DEBUG(...) printf(__VA_ARGS__);
+#else
+    #define PRINT_DEBUG(...)  
+#endif
+
 using namespace ART_OLC;
 
 template <typename T, typename W = TWrapped<T>>
@@ -25,15 +35,32 @@ class TART : public Tree, TObject {
 	static constexpr TransItem::flags_type delete_bit = TransItem::user0_bit << 1;
 
 	static constexpr uintptr_t nodeset_bit = 1;
+	
+	using ins_res = std::tuple<bool, bool>;
+	using lookup_res = std::tuple<TID, bool>;
+
+public:
+	TART(LoadKeyFunction loadKeyFun) : Tree(loadKeyFun) { }
 
 	typedef struct record {
+		// TODO: We might not need to store key here!
+		// ART itself does not store actual keys, client is responsible for
+		// TID to key mapping. We can find a key by calling loadKey(tid, key);
 		Key key;
-		TID val;
+		const TID val;
 		version_type version;
 		bool deleted;
 
-		record(const Key& k, const TID v, bool valid): key(k), val(v),
-				version(valid? Sto::initialized_tid(): Sto::initialized_tid() | invalid_bit, !valid), deleted(false) {}
+		record(const Key& k, const TID v, bool valid):val(v),
+		// Old STO Does not take a bool argument in version constructor
+		//		version(valid? Sto::initialized_tid(): Sto::initialized_tid() | invalid_bit, !valid), deleted(false) {}
+		version(valid? Sto::initialized_tid(): Sto::initialized_tid() | invalid_bit), deleted(false) {
+			char * key_dat = new char[k.getKeyLen()];
+			for(uint32_t i=0; i<k.getKeyLen(); i++){
+				key_dat[i] = (char) k[i];
+			}
+			key.set(key_dat, k.getKeyLen());
+		}
 
 		bool valid() const {
 			return !(version.value() & invalid_bit);
@@ -41,50 +68,100 @@ class TART : public Tree, TObject {
 
 	}record;
 
-	void t_insert(const Key & k, TID tid, ThreadInfo &epocheInfo){
+	static TID getTIDFromRec(TID tid){
+		record* rec = reinterpret_cast<record*>(tid);
+		return rec->val;
+	}
+
+	lookup_res t_lookup(const Key& k, ThreadInfo& threadEpocheInfo){
+		PRINT_DEBUG("Lookup key %s\n", keyToStr(k).c_str())
 		trans_info* t_info = new trans_info();
+		memset(t_info, 0, sizeof(trans_info));
+		TID tid = lookup(k, threadEpocheInfo, t_info);
+		if (tid == 0){ // not found. Add it in the node set!
+			ns_add_node(t_info->cur_node, t_info->cur_node_vers);
+			return lookup_res(0, true);
+		}
+		record* rec = reinterpret_cast<record*>(tid);
+		// add to read set
+		auto item = Sto::item(this, rec);
+		item.observe(rec->version);
+		return lookup_res(rec->val, true);
+		//abort:
+		//	return lookup_res(0, false);
+	}
+
+	ins_res t_insert(const Key & k, TID tid, ThreadInfo &epocheInfo){
+		trans_info* t_info = new trans_info();
+		memset(t_info, 0, sizeof(trans_info));
+		PRINT_DEBUG("Transactionally Inserting (key:%s, tid:%lu)\n", keyToStr(k).c_str(), tid)
 		insert(k, tid, epocheInfo, t_info); 
-		N* n = t_info->ins_node;
+		N* n = t_info->cur_node;
 		N* l_n = t_info->l_node;
 		N* l_p_n = t_info->l_parent_node;
 		uint8_t key_ind = t_info->key_ind;
 		// create a poisoned record (invalid bit set)
 		record* rec = new record(k, tid, false);
+		PRINT_DEBUG("Creating new record %p with key %s\n", rec, keyToStr(k).c_str())
 		auto item = Sto::item(this, rec);
 		// add this record in the appropriate node
 		switch(n->getType()){
 			case NTypes::N4:
-				(static_cast<N4*>(n))->insert(0, N::setLeaf(static_cast<TID>(rec)));
+				(static_cast<N4*>(n))->insert(key_ind, N::setLeaf(reinterpret_cast<TID>(rec)));
 				break;
 			case NTypes::N16:
-				(static_cast<N16*>(n))->insert(0, N::setLeaf(static_cast<TID>(rec)));
+				(static_cast<N16*>(n))->insert(key_ind, N::setLeaf(reinterpret_cast<TID>(rec)));
                  break;
 			case NTypes::N48:
-                (static_cast<N48*>(n))->insert(0, N::setLeaf(static_cast<TID>(rec)));
+                (static_cast<N48*>(n))->insert(key_ind, N::setLeaf(reinterpret_cast<TID>(rec)));
                  break;
 			case NTypes::N256:
-                (static_cast<N256*>(n))->insert(0, N::setLeaf(static_cast<TID>(rec)));
+                (static_cast<N256*>(n))->insert(key_ind, N::setLeaf(reinterpret_cast<TID>(rec)));
                  break;
 		}
-		// add to node set
-		if(! update_AVN(n, t_info->ins_node_vers, n->getVersion())) {
-			//abort
+		// update AVN in node set, if exists
+		if(! ns_update_node_AVN(n, t_info->cur_node_vers, n->getVersion())) {
+			goto abort;
 		}
 		item.add_write();
 		item.add_flags(insert_bit);
+		PRINT_DEBUG("-- Unlocking node %p\n", l_n);
 		l_n->writeUnlock();
-		if(l_p_n)
+		if(l_p_n){
+			PRINT_DEBUG("-- Unlocking parent node %p\n", l_p_n);
 			l_p_n->writeUnlock();
+		}
+		if(l_n == n)
+			PRINT_DEBUG("We are unlocking the node we just inserted to!! (%p)\n", n)
+		PRINT_DEBUG(" ==== Now node's %p AVN:%lu\n", n, n->getVersion())
+		//TransItem& item_tmp = item.item();
+		//record* rec_tmp = item_tmp.key<record*>();
+		//PRINT_DEBUG("Inserted key %s\n", keyToStr(rec_tmp->key).c_str())
+		return ins_res(true, true);
+		abort:
+			return ins_res(false, false);
 	}
 
+	// Adds a node and its AVN in the node set
+	bool ns_add_node(N* node, uint64_t vers){
+        auto item = Sto::item(this, get_nodeset_key(node));
+        if(!item.has_read()){
+            PRINT_DEBUG("Adding node %p to node set with version %lu\n", node, vers)
+            item.add_read(vers);
+        }   
+        return false;
+    }   
+
+
 	// Updates the AVN of a node in the node set
-	bool update_AVN(N* n, uint64_t before_vers, uint64_t after_vers){
+	bool ns_update_node_AVN(N* n, uint64_t before_vers, uint64_t after_vers){
 		auto item = Sto::item(this,	get_nodeset_key(n));
-		if(!item.has_read()){
-			item.add_read(after_vers);
+		if(!item.has_read()){ // node not in the node set, do not add it!
 			return true;
 		}
-		if(before_vers == item.template read_value<uint64_t>){
+		PRINT_DEBUG("node %p: AVN before insert:%lu, AVN after insert:%lu, AVN current in node set:%lu\n",
+					n, before_vers, after_vers, item.template read_value<uint64_t>())
+		if(before_vers == item.template read_value<uint64_t>()){
 			item.update_read(before_vers, after_vers);
 			return true;
 		}
@@ -95,25 +172,52 @@ class TART : public Tree, TObject {
 		return reinterpret_cast<uintptr_t>(node) | nodeset_bit;
 	}
 
+	N* get_node(uintptr_t k){
+		return reinterpret_cast<N*>(k & ~nodeset_bit);
+	}
+
+	bool is_in_nodeset(TransItem& item){
+		return item.key<uintptr_t>() & nodeset_bit;
+	}
 
 	/* STO callbacks
      * -------------
      */
-	bool lock(TransItem&, Transaction&){
-        return true;
+	bool lock(TransItem& item, Transaction& txn){
+		PRINT_DEBUG("Lock\n")
+		assert(!is_in_nodeset(item));
+		record* rec = item.key<record*>();
+		return txn.try_lock(item, rec->version);
     }
 
-	bool check(TransItem&, Transaction&){
-        return true;
+	bool check(TransItem& item, Transaction& ){
+        PRINT_DEBUG("Check\n")
+		if(is_in_nodeset(item)){
+			N* node = get_node(item.key<uintptr_t>());
+			auto live_vers = node->getVersion();
+			auto titem_vers = item.read_value<decltype(node->getVersion())>();
+			PRINT_DEBUG("Node set check: node %p version: %ld, TItem version: %ld\n", node, live_vers, titem_vers)
+			return live_vers == titem_vers;
+		}
+		record* rec = item.key<record*>();
+		PRINT_DEBUG("Read set check: Rec version == TItem version? %u\n", rec->version == item.read_value<decltype(rec->version)>())
+		return rec->version == item.read_value<decltype(rec->version)>();
     }
 
 	void install(TransItem& item, Transaction& txn){
+		PRINT_DEBUG("Install\n")
+		record* rec = item.key<record*>();
+		Key k;
+		loadKey(reinterpret_cast<TID>(rec), k);
+		// clear user bits: Make record valid!
+		txn.set_version_unlock(rec->version, item);
 	}
 
 	void unlock(TransItem&){
     }
 
-	void cleanup(TransItem& item, bool committed){
+	// bool committed
+	void cleanup(TransItem&, bool){
 
     }
 
