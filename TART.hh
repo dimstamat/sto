@@ -16,7 +16,7 @@
 using namespace std;
 #include <iostream>
 
-#define DEBUG 1
+#define DEBUG 0
 #if DEBUG == 1
     #define PRINT_DEBUG(...) printf(__VA_ARGS__);
 #else
@@ -37,6 +37,7 @@ class TART : public Tree, TObject {
 	static constexpr uintptr_t nodeset_bit = 1;
 	
 	using ins_res = std::tuple<bool, bool>;
+	using rem_res = std::tuple<bool, bool>;
 	using lookup_res = std::tuple<TID, bool>;
 
 public:
@@ -45,7 +46,7 @@ public:
 	typedef struct record {
 		// TODO: We might not need to store key here!
 		// ART itself does not store actual keys, client is responsible for
-		// TID to key mapping. We can find a key by calling loadKey(tid, key);
+		// TID to key mapping. We can find a key by calling loadKey(tid, key); (supplied key is empty and initialized by loadKey)
 		Key key;
 		const TID val;
 		version_type version;
@@ -79,12 +80,16 @@ public:
 		memset(t_info, 0, sizeof(trans_info));
 		TID tid = lookup(k, threadEpocheInfo, t_info);
 		if (tid == 0){ // not found. Add it in the node set!
+			PRINT_DEBUG("Not found!\n")
 			ns_add_node(t_info->cur_node, t_info->cur_node_vers);
 			return lookup_res(0, true);
 		}
 		record* rec = reinterpret_cast<record*>(tid);
 		// add to read set
 		auto item = Sto::item(this, rec);
+		if(has_delete(item)){ // current transaction already marked for deletion, reply as it is absent!
+			return lookup_res(0, true);
+		}
 		item.observe(rec->version);
 		return lookup_res(rec->val, true);
 		//abort:
@@ -134,12 +139,41 @@ public:
 		if(l_n == n)
 			PRINT_DEBUG("We are unlocking the node we just inserted to!! (%p)\n", n)
 		PRINT_DEBUG(" ==== Now node's %p AVN:%lu\n", n, n->getVersion())
-		//TransItem& item_tmp = item.item();
-		//record* rec_tmp = item_tmp.key<record*>();
+		//item_tmp = item.item();
+		//rec_tmp = item_tmp.key<record*>();
 		//PRINT_DEBUG("Inserted key %s\n", keyToStr(rec_tmp->key).c_str())
 		return ins_res(true, true);
 		abort:
 			return ins_res(false, false);
+	}
+
+	rem_res t_remove(const Key & k, TID tid, ThreadInfo &threadEpocheInfo){
+		bool tid_mismatch = false;
+		trans_info* t_info = new trans_info();
+		memset(t_info, 0, sizeof(trans_info));
+        PRINT_DEBUG("Transactionally Removing (key:%s, tid:%lu)\n", keyToStr(k).c_str(), tid)
+        TID lookup_tid = lookup(k, threadEpocheInfo, t_info);
+		if(lookup_tid == 0){ // not found, add to node set!
+			ns_add_node(t_info->cur_node, t_info->cur_node_vers);
+			return rem_res(false, true);
+		}
+		record* rec = reinterpret_cast<record*>(lookup_tid);
+		if(rec->val != tid){ // that's the behavior of ART insert: If the encountered tuple id is different than the supplied one, return
+			tid_mismatch = true;
+		}
+		if(rec->deleted) { // abort
+			 return rem_res(false, false);
+		}
+		auto item = Sto::item(this, rec);
+		item.observe(rec->version);
+		if(tid_mismatch){
+			PRINT_DEBUG("Oops, tid mismatch!\n")
+			return rem_res(false, true);
+		}
+		item.add_write();
+		fence();
+		item.add_flags(delete_bit);
+		return rem_res(true, true);
 	}
 
 	// Adds a node and its AVN in the node set
@@ -151,7 +185,6 @@ public:
         }   
         return false;
     }   
-
 
 	// Updates the AVN of a node in the node set
 	bool ns_update_node_AVN(N* n, uint64_t before_vers, uint64_t after_vers){
@@ -180,6 +213,14 @@ public:
 		return item.key<uintptr_t>() & nodeset_bit;
 	}
 
+	static bool has_insert(const TransItem& item){
+		return item.flags() & insert_bit;
+	}
+
+	static bool has_delete(const TransItem& item){
+		return item.flags() & delete_bit;
+	}
+
 	/* STO callbacks
      * -------------
      */
@@ -190,7 +231,7 @@ public:
 		return txn.try_lock(item, rec->version);
     }
 
-	bool check(TransItem& item, Transaction& ){
+	bool check(TransItem& item, Transaction&){
         PRINT_DEBUG("Check\n")
 		if(is_in_nodeset(item)){
 			N* node = get_node(item.key<uintptr_t>());
@@ -200,25 +241,51 @@ public:
 			return live_vers == titem_vers;
 		}
 		record* rec = item.key<record*>();
-		PRINT_DEBUG("Read set check: Rec version == TItem version? %u\n", rec->version == item.read_value<decltype(rec->version)>())
-		return rec->version == item.read_value<decltype(rec->version)>();
+		return item.check_version(rec->version);
     }
 
 	void install(TransItem& item, Transaction& txn){
 		PRINT_DEBUG("Install\n")
+		assert(!is_in_nodeset(item));
 		record* rec = item.key<record*>();
-		Key k;
-		loadKey(reinterpret_cast<TID>(rec), k);
+		PRINT_DEBUG("Key: %s\n", keyToStr(rec->key).c_str())
+		if(has_delete(item)){
+			PRINT_DEBUG("Has delete bit set!\n");
+			if(!has_insert(item)){
+				assert(rec->valid() && ! rec->deleted);
+				txn.set_version(rec->version);
+				rec->deleted = true;
+				fence();
+			}
+			return;
+		}
+		if(!has_insert(item)){ // update : not supported yet
+		}
 		// clear user bits: Make record valid!
 		txn.set_version_unlock(rec->version, item);
 	}
 
-	void unlock(TransItem&){
-    }
+	void unlock(TransItem& item){
+    	PRINT_DEBUG("Unlock\n")
+		assert(!is_in_nodeset(item));
+		record* rec = item.key<record*>();
+		rec->version.unlock();
+	}
 
 	// bool committed
-	void cleanup(TransItem&, bool){
-
+	void cleanup(TransItem& item, bool committed){
+		PRINT_DEBUG("Cleanup\n")
+		assert(!is_in_nodeset(item));
+		record* rec = item.key<record*>();
+		Key k;
+		TID tid = reinterpret_cast<TID>(rec);
+		loadKey(tid, k);
+		ThreadInfo epocheInfo = getThreadInfo();
+		if(committed? has_delete(item) : has_insert(item)){
+			// TODO: might need to check the result of remove (if not found)!Even though we check it earlier in t_remove, it might have been removed later
+			remove(k, tid, epocheInfo);
+			Transaction::rcu_delete(rec);
+		}
+		item.clear_needs_unlock();
     }
-
 };
