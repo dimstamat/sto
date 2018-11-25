@@ -4,18 +4,23 @@
 AR = ar
 CC = @CC@
 CXX = @CXX@
-CPPFLAGS = -I$(MASSTREEDIR) -I$(ARTDIR)
+UTILSDIR = ../util
+CPPFLAGS = -I$(MASSTREEDIR) -I$(ARTDIR) -I$(MURMURHASHDIR) -I$(HIGHWAYHASHDIR) -I$(UTILSDIR) -I$(TBBDIR)/include
 DEPSDIR := .deps
 DEPCFLAGS = -MD -MF $(DEPSDIR)/$*.d -MP
-LIBS = @LIBS@ $(MASSTREEDIR)/libjson.a $(ARTDIR)/build/libARTSynchronized.a -lpthread -lm
+# tbb and jemalloc required for ART
+LIBS = @LIBS@ $(MASSTREEDIR)/libjson.a $(ARTDIR)/build/libARTSynchronized.a $(MURMURHASHDIR)/libSMHasherSupport.a -lpthread -lm -ltbb -ljemalloc
 LIBOBJS = @LIBOBJS@
 LDFLAGS = @LDFLAGS@
 MASSTREEDIR = @MASSTREEDIR@
 ARTDIR = @ARTDIR@
+MURMURHASHDIR = @MURMURHASHDIR@
+HIGHWAYHASHDIR = @HIGHWAYHASHDIR@
+TBBDIR = @TBBDIR@
 
 # if CXXFLAGS changes, rebuild
 ifndef CXXFLAGS
-CXXFLAGS :=
+CXXFLAGS := -mavx2
 endif
 
 ifeq ($(NDEBUG),1)
@@ -71,15 +76,15 @@ CXXFLAGS += -DBOOSTING -DSTO
 endif
 
 # debugging on by default
-ifneq ($(NDEBUG),1)
+#ifneq ($(NDEBUG),1)
 OPTFLAGS += -g
-endif
+#endif
 
 ifeq ($(PROFILE),1)
 OPTFLAGS += -g -pg -fno-inline
 endif
 
-PROGRAMS = concurrent singleelems list1 vector pqueue rbtree trans_test ht_mt pqVsIt iterators single predicates ex-counter $(UNIT_PROGRAMS)
+PROGRAMS = concurrent singleelems list1 vector pqueue rbtree trans_test ht_mt pqVsIt iterators single predicates ex-counter $(UNIT_PROGRAMS) test_bloom_txn test_hybrid test_meme test_meme_tbb
 UNIT_PROGRAMS = unit-tarray unit-tintpredicate unit-tcounter unit-tbox unit-tgeneric unit-rcu unit-tvector unit-tvector-nopred unit-mbta unit-sampling unit-opacity unit-tlayout-bt unit-tart
 
 all: $(PROGRAMS)
@@ -129,6 +134,18 @@ singleelems: singleelems.o $(STO_DEPS)
 	$(CXX) $(CXXFLAGS) $(OPTFLAGS) -o $@ $< $(STO_OBJS) $(LDFLAGS) $(LIBS)
 
 ex-counter: ex-counter.o $(STO_DEPS)
+	$(CXX) $(CXXFLAGS) $(OPTFLAGS) -o $@ $< $(STO_OBJS) $(LDFLAGS) $(LIBS)
+
+test_bloom_txn: test_bloom_txn.o $(STO_DEPS)
+	$(CXX) $(CXXFLAGS) $(OPTFLAGS) -o $@ $< $(STO_OBJS) $(LDFLAGS) $(LIBS)
+
+test_hybrid: test_hybrid.o $(STO_DEPS)
+	$(CXX) $(CXXFLAGS) $(OPTFLAGS) -o $@ $< $(STO_OBJS) $(LDFLAGS) $(LIBS)
+
+test_meme:	test_meme.o $(STO_DEPS)
+	$(CXX) $(CXXFLAGS) $(OPTFLAGS) -o $@ $< $(STO_OBJS) $(LDFLAGS) $(LIBS)
+
+test_meme_tbb:  test_meme_tbb.o $(STO_DEPS)
 	$(CXX) $(CXXFLAGS) $(OPTFLAGS) -o $@ $< $(STO_OBJS) $(LDFLAGS) $(LIBS)
 
 unit-rcu: unit-rcu.o $(STO_DEPS)

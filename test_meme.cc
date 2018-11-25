@@ -42,6 +42,13 @@ std::thread thread_pool[thread_pool_sz];
 
 uint64_t txns_info_arr [nthreads][2] __attribute__((aligned(128)));
 
+#if MEASURE_LATENCIES
+double latencies_rw_lookup_found [nthreads][2] __attribute__((aligned(128)));
+double latencies_rw_lookup_not_found [nthreads][2] __attribute__((aligned(128)));
+double latencies_rw_insert [nthreads][2] __attribute__((aligned(128)));
+#endif
+
+
 void error(int param){
 	fprintf(stderr, "Argument for option %c missing\n", param);
 	exit(-1);
@@ -105,7 +112,7 @@ inline void set_affinity(std::thread& t, unsigned i){
 
 bool initial_build_done = false;
 
-inline void do_insert(uint64_t i, Tree& tree, TART<uint64_t>& tart, ThreadInfo& tinfo, bool txn, bool b_insert ){
+inline void do_insert(unsigned thread_id, uint64_t i, Tree& tree, TART<uint64_t>& tart, ThreadInfo& tinfo, bool txn, bool b_insert ){
 	Key key;
     loadKeyInit(i, key);
 	INIT_COUNTING
@@ -114,8 +121,10 @@ inline void do_insert(uint64_t i, Tree& tree, TART<uint64_t>& tart, ThreadInfo& 
 		tart.t_insert(key, i, tinfo);
 	else
     	tree.insert(key, i, tinfo);
-	if(!b_insert && initial_build_done)
+	if(!b_insert && initial_build_done){
         STOP_COUNTING_PRINT("R/W insert")
+        STOP_COUNTING(latencies_rw_insert, thread_id)
+    }
     #if USE_BLOOM > 0
 		if(b_insert){
 			START_COUNTING
@@ -125,7 +134,7 @@ inline void do_insert(uint64_t i, Tree& tree, TART<uint64_t>& tart, ThreadInfo& 
     #endif
 }
 
-inline void do_lookup(uint64_t i, Tree& tree_rw, Tree& tree_compacted, TART<uint64_t>& tart_rw, TART<uint64_t>& tart_compacted, ThreadInfo& t1, ThreadInfo& t2, uint64_t &num_keys, uint64_t &r_w_size, bool txn, bool check_val){
+inline void do_lookup(unsigned thread_id, uint64_t i, Tree& tree_rw, Tree& tree_compacted, TART<uint64_t>& tart_rw, TART<uint64_t>& tart_compacted, ThreadInfo& t1, ThreadInfo& t2, uint64_t &num_keys, uint64_t &r_w_size, bool txn, bool check_val){
 	Key key;
     uint64_t key_ind = 0;
     bool inRW = false;
@@ -146,6 +155,8 @@ inline void do_lookup(uint64_t i, Tree& tree_rw, Tree& tree_compacted, TART<uint
 	#if USE_BLOOM > 0
 		bool contains = false;
 		INIT_COUNTING
+        
+        //struct timespec start_time, end_time;
 		START_COUNTING
         #if VALIDATE
             uint64_t* hashVal;
@@ -153,7 +164,6 @@ inline void do_lookup(uint64_t i, Tree& tree_rw, Tree& tree_compacted, TART<uint
         #else
             contains = bloom_contains(key.getKey(), key.getKeyLen(), nullptr);
         #endif
-		//STOP_COUNTING_PRINT("bloom contains")
 		if(contains){
 			STOP_COUNTING_PRINT("bloom contains")
 			//cout<<"bloom contains!\n";
@@ -162,19 +172,21 @@ inline void do_lookup(uint64_t i, Tree& tree_rw, Tree& tree_compacted, TART<uint
             TID val = (txn? std::get<0>(tart_rw.t_lookup(key, t1)) : tree_rw.lookup(key, t1));
             if(val == 0){ // not found in R/W! False positive
 				STOP_COUNTING_PRINT("R/W lookup not found")
+				STOP_COUNTING(latencies_rw_lookup_not_found, thread_id)
                 #if PRINT_FALSE_POSITIVES
                 cout <<"False positive!\n";
 				#endif
                 START_COUNTING
                 //cout<<"compacted lookup!\n";
                 TID val = (txn? std::get<0>(tart_compacted.t_lookup(key, t2, false)) : tree_compacted.lookup(key, t2));
-                STOP_COUNTING_PRINT("compacted lookup")
+                //STOP_COUNTING_PRINT("compacted lookup")
 				//printf("Checking after reading from compacted!\n");
 				// only check if we do lookup for an existing key, otherwise we might lookup for a key that is not inserted yet!
                 if(check_val) checkVal(val, key_ind);
 			}
             else {
                 STOP_COUNTING_PRINT("R/W lookup found")
+                STOP_COUNTING(latencies_rw_lookup_found, thread_id)
 				//printf("Checking after reading from R/W!\n");
             	if(check_val) checkVal(val, key_ind);
             }
@@ -198,7 +210,7 @@ inline void do_lookup(uint64_t i, Tree& tree_rw, Tree& tree_compacted, TART<uint
         TID val = (txn ? std::get<0>(tart_rw.t_lookup(key, t1)): tree_rw.lookup(key, t1));
         if(val == 0){
             STOP_COUNTING_PRINT("R/W lookup not found")
-			INIT_COUNTING
+            STOP_COUNTING(latencies_rw_lookup_not_found, thread_id)
         	assert(!inRW);
             START_COUNTING
             //cout<<"compacted lookup!\n";
@@ -209,6 +221,7 @@ inline void do_lookup(uint64_t i, Tree& tree_rw, Tree& tree_compacted, TART<uint
         }
         else {
             STOP_COUNTING_PRINT("R/W lookup found")
+            STOP_COUNTING(latencies_rw_lookup_found, thread_id)
 			//printf("Checking after reading from R/W!\n");
         	if(check_val) checkVal(val, key_ind);
         }
@@ -229,9 +242,9 @@ void insert_partition(unsigned ops_per_txn, unsigned thread_id, unsigned ind_sta
             TRANSACTION {
                 for (uint64_t cur_op=0; cur_op<ops_per_txn && key_ind < ind_end; cur_op++, key_ind++){
                     if(rw_insert)
-                        do_insert(key_ind, tree_rw, tart_rw, t, true, true);
+                        do_insert(thread_id, key_ind, tree_rw, tart_rw, t, true, true);
                     else
-                        do_insert(key_ind, tree_compacted, tart_compacted, t, true, false);
+                        do_insert(thread_id, key_ind, tree_compacted, tart_compacted, t, true, false);
                 }
                 first=false;
             }RETRY(true);
@@ -243,9 +256,9 @@ void insert_partition(unsigned ops_per_txn, unsigned thread_id, unsigned ind_sta
         auto t = rw_insert? tree_rw.getThreadInfo() : tree_compacted.getThreadInfo();
         for(unsigned key_ind = ind_start; key_ind < ind_end; key_ind++){
             if(rw_insert)
-                do_insert(key_ind, tree_rw, tart_rw, t, false, true);
+                do_insert(thread_id, key_ind, tree_rw, tart_rw, t, false, true);
             else
-                do_insert(key_ind, tree_compacted, tart_compacted, t, false, false);
+                do_insert(thread_id, key_ind, tree_compacted, tart_compacted, t, false, false);
         }
     }
 }
@@ -264,7 +277,7 @@ void lookup_partition(unsigned ops_per_txn, unsigned thread_id, uint64_t num_key
         while(key_ind < ind_end){
             TRANSACTION {
                 for (uint64_t cur_op=0; cur_op<ops_per_txn && key_ind < ind_end; cur_op++, key_ind++){
-                    do_lookup(key_ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, r_w_size, true, true);
+                    do_lookup(thread_id, key_ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, r_w_size, true, true);
                 }
             }RETRY(false);
             cur_txns++;
@@ -275,7 +288,7 @@ void lookup_partition(unsigned ops_per_txn, unsigned thread_id, uint64_t num_key
         auto t1 = tree_rw.getThreadInfo();
         auto t2 = tree_compacted.getThreadInfo();
         for(unsigned key_ind = ind_start; key_ind < ind_end; key_ind++){
-            do_lookup(key_ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, r_w_size, false, true);
+            do_lookup(thread_id, key_ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, r_w_size, false, true);
         }
     }
 }
@@ -307,12 +320,12 @@ void insert_lookup_zipf(unsigned ops_per_txn, unsigned ops_per_thread, unsigned 
                 for (cur_op=0; cur_op<ops_per_txn && i<ops_per_thread; cur_op++){
                     if(cur_op % insert_ratio_mod == 0){ // insert
                         // only add in the bloom filter if key index is beyond the new_keys_ind
-                        do_insert(key_inds_txn[cur_op], tree_rw, tart_rw, t1, true, (key_inds_txn[cur_op] >= new_keys_ind));
-                        //do_insert(key_inds_txn[cur_op], tree_rw, tart_rw, t1, true, false);
+                        do_insert(thread_id, key_inds_txn[cur_op], tree_rw, tart_rw, t1, true, (key_inds_txn[cur_op] >= new_keys_ind));
+                        //do_insert(thread_id, key_inds_txn[cur_op], tree_rw, tart_rw, t1, true, false);
                     }
                     else{   // lookup
                         uint64_t n1=0, n2=0;
-                        do_lookup(key_inds_txn[cur_op], tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, n1, n2, true, (key_inds_txn[cur_op] < new_keys_ind));
+                        do_lookup(thread_id, key_inds_txn[cur_op], tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, n1, n2, true, (key_inds_txn[cur_op] < new_keys_ind));
                     }
                 }
             } RETRY_DBG(true);
@@ -393,7 +406,7 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
 		else if (!multithreaded && !transactional){
 			auto t1 = tree_rw.getThreadInfo();
 			for(uint64_t i=1; i<=r_w_size; i++){
-				do_insert(i, tree_rw, tart_rw, t1, false, true);
+				do_insert(0, i, tree_rw, tart_rw, t1, false, true);
 			}
 		}
 		else if (!multithreaded && transactional){
@@ -403,7 +416,7 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
 				GUARDED {
 					for(uint64_t j=1; j<=ops_per_txn; j++){
 						ind = (i-1)*ops_per_txn + j;
-						do_insert(ind, tree_rw, tart_rw, t1, true, true);
+						do_insert(0, ind, tree_rw, tart_rw, t1, true, true);
 					}
 				}
                 total_txns++;
@@ -412,7 +425,7 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
 				uint64_t limit = r_w_size % ops_per_txn;
                 for(uint64_t j=1; j<=limit; j++) { // insert the rest of the keys! (mod)
                     ind++;
-                    do_insert(ind, tree_rw, tart_rw, t1, true, true);
+                    do_insert(0, ind, tree_rw, tart_rw, t1, true, true);
                 }
                 if(limit>=1)
                     total_txns++;
@@ -452,7 +465,7 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
         else if (!multithreaded && !transactional){
 			auto t2 = tree_compacted.getThreadInfo();
 			for(uint64_t i=r_w_size+1; i<=num_keys; i++){
-				do_insert(i, tree_compacted, tart_compacted, t2, false, false);
+				do_insert(0, i, tree_compacted, tart_compacted, t2, false, false);
             }
         }
         else if (!multithreaded && transactional){
@@ -462,7 +475,7 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
                 GUARDED {
                     for(uint64_t j=1; j<=ops_per_txn; j++){
                         ind = r_w_size + (i-1)*ops_per_txn + j;
-                        do_insert(ind, tree_compacted, tart_compacted, t2, true, false);
+                        do_insert(0, ind, tree_compacted, tart_compacted, t2, true, false);
                     }
                 }
 			}
@@ -470,7 +483,7 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
 			GUARDED {
 				for(uint64_t j=1; j<=limit; j++) { // insert the rest of the keys! (mod)
 					ind++;
-					do_insert(ind, tree_compacted, tart_compacted, t2, true, false);
+					do_insert(0, ind, tree_compacted, tart_compacted, t2, true, false);
 				}
 			}
         }
@@ -513,9 +526,9 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
 			auto t2 = tree_compacted.getThreadInfo();
             for(uint64_t i=1; i<=num_keys; i++){
 				if(! lookups_only && ((i-1) % insert_ratio_mod == 0)) // insert
-                	do_insert(i, tree_rw, tart_rw, t1, false, false);
+                	do_insert(0, i, tree_rw, tart_rw, t1, false, false);
 				else
-					do_lookup(i, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, r_w_size, false, true);
+					do_lookup(0, i, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, r_w_size, false, true);
             }
         }
         else if (!multithreaded && transactional){
@@ -527,11 +540,11 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
                     for(uint64_t j=1; j<=ops_per_txn; j++){
                         ind = (i-1)*ops_per_txn + j;
                         if(! lookups_only && ((i-1) % insert_ratio_mod == 0)) // insert
-					        //do_insert(num_keys+ind, tree_rw, tart_rw, t1, true, true);
+					        //do_insert(0, num_keys+ind, tree_rw, tart_rw, t1, true, true);
 					        // try to insert existing key
-					        do_insert(ind, tree_rw, tart_rw, t1, true, false);
+					        do_insert(0, ind, tree_rw, tart_rw, t1, true, false);
 						else
-						    do_lookup(ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, r_w_size, true, true);
+						    do_lookup(0, ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, r_w_size, true, true);
                     }
                 }
                 total_txns++;
@@ -541,9 +554,9 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
                 for(uint64_t j=1; j<=limit; j++) { // lookup the rest of the keys! (mod)
                     ind++;
                     if (! lookups_only && ((j-1) % insert_ratio_mod == 0) ) // insert
-                        do_insert(ind, tree_rw, tart_rw, t1, true, false);
+                        do_insert(0, ind, tree_rw, tart_rw, t1, true, false);
                     else
-                        do_lookup(ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, r_w_size, true, true);
+                        do_lookup(0, ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, r_w_size, true, true);
                 }
                 if(limit>=1)
                     total_txns++;
@@ -565,7 +578,21 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
             txp_counters tc = Transaction::txp_counters_combined();
             printf("total_n: %llu, total_r: %llu, total_w: %llu, total_searched: %llu, total_aborts: %llu (%llu aborts at commit time)\n", tc.p(txp_total_n), tc.p(txp_total_r), tc.p(txp_total_w), tc.p(txp_total_searched), tc.p(txp_total_aborts), tc.p(txp_commit_time_aborts));
         }
-        #endif   
+        #endif
+        #if MEASURE_LATENCIES
+            double rw_lookup_not_found = 0, rw_lookup_not_found_num=0, rw_lookup_found = 0, rw_lookup_found_num=0, rw_insert = 0, rw_insert_num=0;
+            for(unsigned i=0; i<nthreads; i++){
+                rw_lookup_not_found+=latencies_rw_lookup_not_found[i][0];
+                rw_lookup_not_found_num+=latencies_rw_lookup_not_found[i][1];
+                rw_lookup_found+=latencies_rw_lookup_found[i][0];
+                rw_lookup_found_num+=latencies_rw_lookup_found[i][1];
+                rw_insert+=latencies_rw_insert[i][0];
+                rw_insert_num+=latencies_rw_insert[i][1];
+            }
+            printf("RW lookup not found: %lf (#%lf)\n", (rw_lookup_not_found / rw_lookup_not_found_num) * 1000.0, rw_lookup_not_found_num);
+            printf("RW lookup found: %lf (#%lf)\n", (rw_lookup_found / rw_lookup_found_num) * 1000.0, rw_lookup_found_num);
+            printf("RW insert: %lf (#%lf)\n", (rw_insert / rw_insert_num) * 1000.0, rw_insert_num);
+        #endif
 	}
 	// Remove
 	{ /*
@@ -636,6 +663,12 @@ int main(int argc, char **argv) {
 
 	#if USE_BLOOM > 0
 	memset(bloom, 0, BLOOM_SIZE * sizeof(uint64_t));
+    #endif
+
+    #if MEASURE_LATENCIES
+    bzero(latencies_rw_lookup_found [nthreads], (2*nthreads)*sizeof(double));
+    bzero(latencies_rw_lookup_not_found [nthreads], (2*nthreads)*sizeof(double));
+    bzero(latencies_rw_insert [nthreads], (2*nthreads)*sizeof(double));
     #endif
 
 	while((c = getopt_long(argc, argv, ":f:g:r:i:x:t:sm", long_opt, NULL)) != -1){

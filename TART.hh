@@ -416,7 +416,7 @@ public:
         }
         #endif
         record* rec = item.key<record*>();
-        bool okay = item.check_version(rec->version);
+        okay = item.check_version(rec->version);
         if(!okay)
             PRINT_DEBUG_VALIDATION("VALIDATION FAILED: STO VERSION MISMATCH\n");
         return okay;
