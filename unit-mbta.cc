@@ -75,10 +75,10 @@ void inserter(mbta_type* mbta) {
 int main() {
     mbta_type mbta;
 
-    std::thread scn(scanner, &mbta);
-    std::thread ins(inserter, &mbta);
-    scn.join();
-    ins.join();
-    std::cout << "Test pass." << std::endl;
+    //std::thread scn(scanner, &mbta);
+    //std::thread ins(inserter, &mbta);
+    //scn.join();
+    //ins.join();
+    //std::cout << "Test pass." << std::endl;
     return 0;
 }

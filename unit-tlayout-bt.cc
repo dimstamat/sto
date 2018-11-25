@@ -37,10 +37,14 @@ int main() {
 	TLayoutBT<unsigned> tree;
 	dptrtype* dirtyP = tree.llock_.getDirtyP();
 
-	tree.insert(123, dirtyP);
-	cout<< tree.size(tree.head) << endl;
+	{
+		TestTransaction t1(1);
+		tree.insert(123, dirtyP);
+		//cout<< tree.size(tree.head) << endl;
+		assert(t1.try_commit());
+	}
 
-	std::vector<std::thread> threads;
+	/*std::vector<std::thread> threads;
 
 	for (int i=0; i<10; i++){
 		threads.push_back(std::thread(thread_f, i));
@@ -48,7 +52,7 @@ int main() {
 
 	for (int i=0; i<10; i++){
 		threads[i].join();
-	}
+	}*/
 
 	return 0;
 }
