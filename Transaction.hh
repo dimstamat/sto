@@ -13,7 +13,7 @@
 #include <sstream>
 
 #ifndef STO_PROFILE_COUNTERS
-#define STO_PROFILE_COUNTERS 0
+#define STO_PROFILE_COUNTERS 1
 #endif
 #ifndef STO_TSC_PROFILE
 #define STO_TSC_PROFILE 0
@@ -90,7 +90,11 @@
 
 #include "config.h"
 
+// Dim: time measuring
+#include "../util/measure_latencies.hh"
+
 #define MAX_THREADS 32
+
 
 // TRANSACTION macros that can be used to wrap transactional code
 #define TRANSACTION                               \
@@ -100,7 +104,7 @@
             __txn_guard.start();                  \
             try {
 #define RETRY(retry)                              \
-                if (__txn_guard.try_commit())     \
+                if (__txn_guard.try_commit())   \
                     break;                        \
             } catch (Transaction::Abort e) {      \
             }                                     \
@@ -108,6 +112,28 @@
                 throw Transaction::Abort();       \
         }                                         \
     } while (0)
+
+#define TRANSACTION_DBG                           \
+    do {                                          \
+        TransactionLoopGuard __txn_guard;         \
+        while (1) {                               \
+            __txn_guard.start();                  \
+            try {                                 
+#define RETRY_DBG(retry)                          \
+                START_COUNTING                    \
+                if (__txn_guard.try_commit()) {   \
+                    STOP_COUNTING_PRINT("COMMIT")       \
+                    break;                        \
+                }                                 \
+                /*std::cout<<"ABORT!\n";*/         \
+            } catch (Transaction::Abort e) {      \
+                /*std::cout<<"ABORT!\n";*/         \
+            }                                     \
+            if (!(retry))                         \
+                throw Transaction::Abort();       \
+        }                                         \
+    } while(0)                                    \
+
 
 // transaction performance counters
 enum txp {

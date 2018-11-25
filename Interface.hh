@@ -3,6 +3,9 @@
 #include <assert.h>
 #include <iostream>
 
+using namespace std;
+
+
 #include "config.h"
 #include "compiler.hh"
 

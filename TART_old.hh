@@ -16,11 +16,26 @@
  *    April 9 2018
  */
 
-#include "bloom.hh"
-#include "bloom_packing.hh"
 
 using namespace std;
 #include <iostream>
+
+
+
+#define USE_BLOOM 2 // 1 for initial bloom, 2 for bloom packing
+
+#if USE_BLOOM == 1
+#include "bloom_old.hh"
+using namespace Bloom;
+std::atomic<uint64_t> Bloom::bloom [BLOOM_SIZE];// __attribute__((aligned(64)));
+uint64_t Bloom::bloom [BLOOM_SIZE];
+#elif USE_BLOOM == 2
+#include "bloom_packing_old.hh"
+using namespace BloomPacking;
+std::atomic<uint64_t> BloomPacking::bloom [BLOOM_SIZE]; // __attribute__((aligned(64)));
+#endif
+
+
 
 #define DEBUG 0
 #if DEBUG == 1
@@ -43,8 +58,6 @@ using ins_res = std::tuple<bool, bool>;
 using rem_res = std::tuple<bool, bool>;
 using lookup_res = std::tuple<TID, bool>;
 
-enum bloom_t {packing, nopacking, nobloom};
-
 
 template <typename T, typename W = TWrapped<T>>
 class TART : public Tree, TObject {
@@ -57,26 +70,10 @@ class TART : public Tree, TObject {
 
 	static constexpr uintptr_t nodeset_bit = 1LU << 63;
     static constexpr uintptr_t bloom_validation_bit = 1LU << 62;
-    BloomPacking* bloomPacking;
-    BloomNoPacking* bloomNoPacking;
-    bloom_t bloom_type;
 	
 public:
-    // virtual functions are costly in C++. Thus, keep a void* for bloom and cast it to the appropriate type internally
-	TART(LoadKeyFunction loadKeyFun, bloom_t bloom_type) : Tree(loadKeyFun), bloom_type(bloom_type) { }
-
-    void setBloom(void* bloom){
-        switch(bloom_type){
-            case packing:
-                bloomPacking = (BloomPacking*) bloom;
-                break;
-            case nopacking:
-                bloomNoPacking = (BloomNoPacking*)bloom;
-                break;
-            case nobloom:
-                break;
-        };
-    }
+    
+	TART(LoadKeyFunction loadKeyFun) : Tree(loadKeyFun) { }
 
 	typedef struct record {
 		// TODO: We might not need to store key here!
@@ -287,10 +284,6 @@ public:
 
     // add in a separate data structure! Performance is bad when we create a Sto::item per absent bloom filter element
     void bloom_v_add_key(uint64_t* hashVal){
-        if(bloom_type == nobloom){
-            fprintf(stderr, "Should not call bloom_v_add_key when nobloom is selected!\n");
-            return;
-        }
         if (( reinterpret_cast<uintptr_t>(hashVal) & bloom_validation_bit ) != 0){
             cout<<"Oops, 62nd bit is set!\n";
             cout<<"Oops, hashVal is "<<hashVal<<endl;
@@ -391,36 +384,28 @@ public:
             }
             return live_vers == titem_vers;
 		}
-        #if VALIDATE
-        if(bloom_type != nobloom) {
-            if(is_in_bloomset(item)){
-                uint64_t* hash = get_bloomset_hash_val(item.key<uintptr_t>());
-                bool contains = false;
-                switch(bloom_type){
-                    case packing:
-                        contains = bloomPacking->bloom_contains_hash(hash);
-                        break;
-                    case nopacking:
-                        contains = bloomNoPacking->bloom_contains_hash(hash);
-                        break;
-                    default:
-                        fprintf(stderr, "Unkown bloom filter type!\n");
-                        return false;
-                };
-                if(contains){
-                    PRINT_DEBUG_VALIDATION("VALIDATION FAILED: BLOOMSET\n");
-                    return false;
-                }
-                return true;
+        #if VALIDATE && USE_BLOOM > 0
+        if(is_in_bloomset(item)){
+            uint64_t* hash = get_bloomset_hash_val(item.key<uintptr_t>());
+            if(bloom_contains_hash(hash)){
+                PRINT_DEBUG_VALIDATION("VALIDATION FAILED: BLOOMSET\n");
+                return false;
             }
+            return true;
         }
         #endif
         record* rec = item.key<record*>();
-        bool okay = item.check_version(rec->version);
+        //assert(txn.threadid() == TThread::id());
+        okay = item.check_version(rec->version);
+        STOP_COUNTING_PRINT("validate")
+        START_COUNTING
+        STOP_COUNTING_PRINT("empty")
+        PRINT_DEBUG("Check returns: %u\n", okay)
         if(!okay)
             PRINT_DEBUG_VALIDATION("VALIDATION FAILED: STO VERSION MISMATCH\n");
         return okay;
     }
+
 	void install(TransItem& item, Transaction& txn){
 		PRINT_DEBUG("Install\n")
 		assert(!is_in_nodeset(item));
@@ -467,8 +452,8 @@ public:
 			Transaction::rcu_delete(rec);
 		}
 		item.clear_needs_unlock();
-        #if VALIDATE
-        if(bloom_type != nobloom && is_in_bloomset(item)){
+        #if VALIDATE && USE_BLOOM > 0
+        if(is_in_bloomset(item)){
             uint64_t* hashVal = get_bloomset_hash_val(item.key<uintptr_t>());
             delete hashVal;
         }

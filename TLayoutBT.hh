@@ -72,8 +72,9 @@ class TLayoutBT: public LayoutTree, public TObject {
 			treelet_log = item.template write_value<std::map<T,bool>* >();
 		}
 		else {
+			cout <<"insert: Creating new log for treelet"<<endl;
         	treelet_log = new std::map<T, bool>();
-			item.add_write(*treelet_log);
+			item.add_write(treelet_log);
 		}
 		(*treelet_log)[key] = true;
         // will do the actual insert in install phase!
@@ -101,8 +102,9 @@ class TLayoutBT: public LayoutTree, public TObject {
 			treelet_log = item.template write_value<std::map<T,bool> *>();
         }
 		else {
+			cout<<"remove: Creating new log for treelet"<<endl;
 			treelet_log = new std::map<T, bool>();
-            item.add_write(*treelet_log);
+            item.add_write(treelet_log);
 		}
         (*treelet_log)[key] = false;
 		//item.add_flags(TransItem::user0_bit); // specify it is a remove operation : No need now! We specify it at the boolean value of the treelet_log map
@@ -135,23 +137,31 @@ class TLayoutBT: public LayoutTree, public TObject {
     }
 	// modifications will be applied now
     void install(TransItem& item, Transaction& txn){
+		cout << "STO::install callback"<<endl;
 		GlobalLockTree* t = item.key<GlobalLockTree*>();
 		bool res;
 		std::map<T, bool>* treelet_log = item.template write_value<std::map<T, bool>*>();
 		for (const auto& log_entry: *treelet_log){
 			if(log_entry.second){
-				t->insert(log_entry.first);
+				res = t->insert(log_entry.first);
 			}
 			else{
-				t->remove(log_entry.first);
+				res = t->remove(log_entry.first);
 			}
+			if (!res)
+				txn.abort();
 		}
-		// if (!res)
-		// txn->abort();
+		t->release();
+		delete treelet_log;
 	}
 
     void unlock(TransItem&){
 
     }
+
+
+	void cleanup(TransItem&, bool){
+		
+	}
 
 };
