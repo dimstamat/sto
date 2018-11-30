@@ -164,7 +164,6 @@ inline void do_lookup(uint64_t i, Tree& tree_rw, Tree& tree_compacted, TART<uint
         TID val = (txn ? std::get<0>(tart_rw.t_lookup(key, t1)): tree_rw.lookup(key, t1));
         if(val == 0){
             STOP_COUNTING_PRINT("R/W lookup not found")
-			INIT_COUNTING
         	assert(!inRW);
             START_COUNTING
             TID val = (txn? std::get<0>(tart_compacted.t_lookup(key, t2, false)) : tree_compacted.lookup(key, t2));

@@ -46,6 +46,7 @@ uint64_t txns_info_arr [nthreads][2] __attribute__((aligned(128)));
 double latencies_rw_lookup_found [nthreads][2] __attribute__((aligned(128)));
 double latencies_rw_lookup_not_found [nthreads][2] __attribute__((aligned(128)));
 double latencies_rw_insert [nthreads][2] __attribute__((aligned(128)));
+double latencies_commit [nthreads][2] __attribute__((aligned(128)));
 #endif
 
 
@@ -328,7 +329,7 @@ void insert_lookup_zipf(unsigned ops_per_txn, unsigned ops_per_thread, unsigned 
                         do_lookup(thread_id, key_inds_txn[cur_op], tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, n1, n2, true, (key_inds_txn[cur_op] < new_keys_ind));
                     }
                 }
-            } RETRY_DBG(true);
+            } RETRY_DBG(true, latencies_commit, thread_id);
             i+=cur_op;
             cur_txns++;
         }
@@ -580,7 +581,7 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
         }
         #endif
         #if MEASURE_LATENCIES
-            double rw_lookup_not_found = 0, rw_lookup_not_found_num=0, rw_lookup_found = 0, rw_lookup_found_num=0, rw_insert = 0, rw_insert_num=0;
+            double rw_lookup_not_found = 0, rw_lookup_not_found_num=0, rw_lookup_found = 0, rw_lookup_found_num=0, rw_insert = 0, rw_insert_num=0, commit=0, commit_num=0;
             for(unsigned i=0; i<nthreads; i++){
                 rw_lookup_not_found+=latencies_rw_lookup_not_found[i][0];
                 rw_lookup_not_found_num+=latencies_rw_lookup_not_found[i][1];
@@ -588,10 +589,13 @@ void run_bench(uint64_t num_keys, uint64_t r_w_size, unsigned insert_ratio, unsi
                 rw_lookup_found_num+=latencies_rw_lookup_found[i][1];
                 rw_insert+=latencies_rw_insert[i][0];
                 rw_insert_num+=latencies_rw_insert[i][1];
+                commit+=latencies_commit[i][0];
+                commit_num+=latencies_commit[i][1];
             }
             printf("RW lookup not found: %lf (#%lf)\n", (rw_lookup_not_found / rw_lookup_not_found_num) * 1000.0, rw_lookup_not_found_num);
             printf("RW lookup found: %lf (#%lf)\n", (rw_lookup_found / rw_lookup_found_num) * 1000.0, rw_lookup_found_num);
             printf("RW insert: %lf (#%lf)\n", (rw_insert / rw_insert_num) * 1000.0, rw_insert_num);
+            printf("commit: %lf (#%lf)\n", (commit / commit_num) * 1000.0, commit_num);
         #endif
 	}
 	// Remove
@@ -666,9 +670,10 @@ int main(int argc, char **argv) {
     #endif
 
     #if MEASURE_LATENCIES
-    bzero(latencies_rw_lookup_found [nthreads], (2*nthreads)*sizeof(double));
-    bzero(latencies_rw_lookup_not_found [nthreads], (2*nthreads)*sizeof(double));
-    bzero(latencies_rw_insert [nthreads], (2*nthreads)*sizeof(double));
+    bzero(latencies_rw_lookup_found, (2*nthreads)*sizeof(double));
+    bzero(latencies_rw_lookup_not_found, (2*nthreads)*sizeof(double));
+    bzero(latencies_rw_insert, (2*nthreads)*sizeof(double));
+    bzero(latencies_commit, (2*nthreads)* sizeof(double));
     #endif
 
 	while((c = getopt_long(argc, argv, ":f:g:r:i:x:t:sm", long_opt, NULL)) != -1){
@@ -757,9 +762,9 @@ int main(int argc, char **argv) {
 
 	keys2_read--;
     cout<<"keys read:" <<(keys_read + keys2_read)<<endl;
-	zipf = ZipfianGenerator(1, keys_read+keys2_read, skew);
+	//zipf = ZipfianGenerator(1, keys_read+keys2_read, skew);
     // ask from RO only!
-    //zipf = ZipfianGenerator(700001, keys_read+keys2_read, skew);
+    zipf = ZipfianGenerator(700001, keys_read+keys2_read, skew);
     cout<<"Generated zipf distribution of "<<zipf.getItems()<<" numbers\n";
     cout<<"Running bench with insert ratio "<< insert_ratio <<endl;
     run_bench(keys_read, r_w_size, insert_ratio, ops_per_txn, ops_per_thread, keys_read+1, multithreaded);

@@ -119,10 +119,10 @@
         while (1) {                               \
             __txn_guard.start();                  \
             try {                                 
-#define RETRY_DBG(retry)                          \
+#define RETRY_DBG(retry, array, tid)              \
                 START_COUNTING                    \
                 if (__txn_guard.try_commit()) {   \
-                    STOP_COUNTING_PRINT("COMMIT")       \
+                    STOP_COUNTING(array, tid)     \
                     break;                        \
                 }                                 \
                 /*std::cout<<"ABORT!\n";*/         \
