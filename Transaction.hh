@@ -95,39 +95,144 @@
 
 #define MAX_THREADS 32
 
+#define BACKOFF 1
+#define BACKOFF_MAX 64
+// 2100
+// 4100
+// 10000
+// 66000
+// 270000
+
+#if BACKOFF == 1
+    #define INIT_BACKOFF unsigned backoff_time=0;
+    #define INCREASE_WAIT /*stringstream ss; ss<<"Incr, before "<<backoff_time<<endl; cout<<ss.str();*/\
+                            backoff_time = (backoff_time==0? 1: (backoff_time*2 <= BACKOFF_MAX? backoff_time*2 : backoff_time ));\
+                          /*ss.clear(); ss<<"Incr, after "<<backoff_time<<endl; cout<<ss.str();*/\
+                          usleep(backoff_time);
+    #define DECREASE_WAIT   /*stringstream ss; ss<<"Decr, before "<<backoff_time<<endl; cout<<ss.str();*/\
+                            backoff_time = (backoff_time == 0? backoff_time : backoff_time/2); \
+                            /*ss.clear(); ss<<"Decr, after "<<backoff_time<<endl; cout<<ss.str()*/;
+    #define RESET_WAIT backoff_time = 0;
+#else
+    #define INIT_BACKOFF {}
+    #define INCREASE_WAIT {}
+    #define DECREASE_WAIT {}
+    #define RESET_WAIT {}
+#endif
 
 // TRANSACTION macros that can be used to wrap transactional code
 #define TRANSACTION                               \
+    {                                             \
+    INIT_BACKOFF                                  \
     do {                                          \
+        __label__ abort_in_progress;              \
+        __label__ try_commit;                     \
+        __label__ after_commit;                   \
         TransactionLoopGuard __txn_guard;         \
         while (1) {                               \
             __txn_guard.start();                  \
             try {
 #define RETRY(retry)                              \
+            goto try_commit;                      \
+abort_in_progress:                                \
+            __txn_guard.silent_abort();           \
+            goto after_commit;                    \
+try_commit:                                       \
+            if (__txn_guard.try_commit()){        \
+                DECREASE_WAIT                     \
+                break;                            \
+            }                                     \
+            } catch (Transaction::Abort e){       \
+                 /*std::cout<<"ABORT - catch exception\n";*/\
+                __txn_guard.silent_abort();       \
+            }                                     \
+after_commit:                                     \
+            if (!(retry)) {                       \
+                break;                            \
+            }                                     \
+        }                                         \
+    } while (false);                              \
+    }
+
+#define TRANSACTION_DBG                           \
+    {                                             \
+    INIT_BACKOFF                                  \
+    do {                                          \
+        __label__ abort_in_progress;              \
+        __label__ try_commit;                     \
+        __label__ after_commit;                   \
+        TransactionLoopGuard __txn_guard;         \
+        while (1) {                               \
+            __txn_guard.start();                  \
+        try{                                      
+#define RETRY_DBG(retry, array, tid)              \
+            goto try_commit;                      \
+abort_in_progress:                                \
+            __txn_guard.silent_abort();           \
+            goto after_commit;                    \
+try_commit:                                       \
+            START_COUNTING                        \
+            if (__txn_guard.try_commit()){        \
+                DECREASE_WAIT                     \
+                STOP_COUNTING(array, tid)         \
+                break;                            \
+            }                                     \
+            }                                     \
+            catch (Transaction::Abort e){         \
+                INCR(aborts[TThread::id()][8])        \
+                /*std::cout<<"ABORT - catch exception\n";*/ \
+                __txn_guard.silent_abort();       \
+            }                                     \
+after_commit:                                     \
+            if (!(retry)) {                       \
+                break;                            \
+            }                                     \
+        }                                         \
+    } while (false);                              \
+    }
+
+
+#define TXN_DO(trans_op)     \
+if (!(trans_op)){             \
+    /*cout<<"Exec abort\n";*/   \
+    INCREASE_WAIT                \
+    goto abort_in_progress; \
+}
+
+#define TRANSACTION_E                               \
+    do {                                          \
+        TransactionLoopGuard __txn_guard;         \
+        while (1) {                               \
+            __txn_guard.start();                  \
+            try {
+#define RETRY_E(retry)                              \
                 if (__txn_guard.try_commit())   \
                     break;                        \
             } catch (Transaction::Abort e) {      \
+                __txn_guard.silent_abort();  \
             }                                     \
             if (!(retry))                         \
                 throw Transaction::Abort();       \
         }                                         \
     } while (0)
 
-#define TRANSACTION_DBG                           \
+#define TRANSACTION_E_DBG                           \
     do {                                          \
         TransactionLoopGuard __txn_guard;         \
         while (1) {                               \
             __txn_guard.start();                  \
+                /*cout<<"START\n";*/                \
             try {                                 
-#define RETRY_DBG(retry, array, tid)              \
+#define RETRY_E_DBG(retry, array, tid)              \
                 START_COUNTING                    \
                 if (__txn_guard.try_commit()) {   \
                     STOP_COUNTING(array, tid)     \
                     break;                        \
                 }                                 \
-                /*std::cout<<"ABORT!\n";*/         \
+                /*std::cout<<"ABORT\n";*/         \
             } catch (Transaction::Abort e) {      \
-                /*std::cout<<"ABORT!\n";*/         \
+                __txn_guard.silent_abort();   \
+                /*std::cout<<"ABORT - catch exception\n";*/   \
             }                                     \
             if (!(retry))                         \
                 throw Transaction::Abort();       \
@@ -620,8 +725,9 @@ public:
     bool try_commit();
 
     void commit() {
-        if (!try_commit())
+        if (!try_commit()){
             throw Abort();
+        }
     }
 
     bool aborted() {
@@ -970,6 +1076,10 @@ class TransactionLoopGuard {
     void start() {
         Sto::start_transaction();
     }
+    void silent_abort() {
+        TThread::txn->silent_abort();
+    }
+
     bool try_commit() {
         return TThread::txn->try_commit();
     }

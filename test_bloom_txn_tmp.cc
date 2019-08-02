@@ -450,7 +450,7 @@ void multithreaded(uint64_t n, uint64_t operations_n, unsigned ops_per_txn, unsi
 							#if USE_BLOOM
                                 bool contains = false;
 								TID val;
-                                #if VALIDATE
+                                #if BLOOM_VALIDATE
                                     uint64_t * hashVal;
 								    contains = bloom_contains(&key_dat, sizeof(uint64_t), &hashVal);
                                 #else
@@ -479,7 +479,7 @@ void multithreaded(uint64_t n, uint64_t operations_n, unsigned ops_per_txn, unsi
 									}
 								}
 								else {
-                                    #if VALIDATE
+                                    #if BLOOM_VALIDATE == 1
                                         tree_rw.bloom_v_add_key(hashVal);
                                     #endif
 									assert(!inRW);

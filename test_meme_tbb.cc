@@ -118,10 +118,10 @@ inline void do_lookup(uint64_t i, Tree& tree_rw, Tree& tree_compacted, TART<uint
 		bool contains = false;
 		INIT_COUNTING
 		START_COUNTING
-        #if VALIDATE
+        #if BLOOM_VALIDATE == 1
             uint64_t* hashVal;
 		    contains = bloom_contains(key.getKey(), key.getKeyLen(), &hashVal);
-        #else
+        #elif BLOOM_VALIDATE == 0
             contains = bloom_contains(key.getKey(), key.getKeyLen(), nullptr);
         #endif
 		//STOP_COUNTING_PRINT("bloom contains")
@@ -149,8 +149,8 @@ inline void do_lookup(uint64_t i, Tree& tree_rw, Tree& tree_compacted, TART<uint
 		}
         else { // add key in bloom filter validation! Just the hash of the key is enough.
             STOP_COUNTING_PRINT("bloom doesn't contain")
-            #if VALIDATE
-                tart_rw.bloom_v_add_key(hashVal);
+            #if BLOOM_VALIDATE
+                //tart_rw.bloom_v_add_key(hashVal);
             #endif
             assert(!inRW);
             START_COUNTING

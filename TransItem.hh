@@ -9,6 +9,9 @@
 
 class TransProxy;
 
+// for bloom filter validation
+#define BLOOM_VALIDATE 2
+
 class TransItem {
   public:
 #if SIZEOF_VOID_P == 8
@@ -30,6 +33,11 @@ class TransItem {
     static constexpr int userf_shift = 48;
     static constexpr flags_type shifted_userf_mask = 0x7FF;
     static constexpr flags_type special_mask = owner_mask | read_bit | write_bit | lock_bit | predicate_bit | stash_bit;
+
+    // add extra field to store the bloom hash value for bloom validation
+    #if BLOOM_VALIDATE == 2
+        uint64_t hashValue[2];
+    #endif
 
 
     TransItem() = default;

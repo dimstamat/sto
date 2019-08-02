@@ -20,9 +20,11 @@
 using namespace std;
 #include <iostream>
 
-
-
-#define USE_BLOOM 2 // 1 for initial bloom, 2 for bloom packing
+#define USE_BLOOM 0 // 1 for initial bloom, 2 for bloom packing
+#define DEBUG 0
+#define DEBUG_VALIDATION 0
+#define MEASURE_ABORTS  0
+#define ABSENT_VALIDATION 1 // 1 for node set, 2 for node set with absent keys, 3 for absent keys and lookup starting from target node, 4 for key set
 
 #if USE_BLOOM == 1
 #include "bloom_old.hh"
@@ -37,14 +39,12 @@ std::atomic<uint64_t> BloomPacking::bloom [BLOOM_SIZE]; // __attribute__((aligne
 
 
 
-#define DEBUG 0
 #if DEBUG == 1
     #define PRINT_DEBUG(...) {printf(__VA_ARGS__);}
 #else
     #define PRINT_DEBUG(...)  {}
 #endif
 
-#define DEBUG_VALIDATION 0
 #if DEBUG_VALIDATION == 1
     #define PRINT_DEBUG_VALIDATION(...) {printf(__VA_ARGS__);}
 #else
@@ -58,6 +58,31 @@ using ins_res = std::tuple<bool, bool>;
 using rem_res = std::tuple<bool, bool>;
 using lookup_res = std::tuple<TID, bool>;
 
+static constexpr uintptr_t dont_cast_from_rec_bit = 1LU << 60;
+
+#if MEASURE_ART_NODE_ACCESSES == 1
+static unsigned accessed_nodes_sum=0;
+static unsigned accessed_nodes_num=0;
+#endif
+
+
+#if MEASURE_ABORTS == 1
+extern const int nthreads;
+static const unsigned aborts_sz = 10;
+uint64_t aborts[nthreads][aborts_sz];
+static string aborts_descr[aborts_sz];
+#define INCR(arg) arg+=1;
+#else
+    #define INCR(arg) {}
+#endif
+
+#if ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+// That's the list of absent keys for a particular node. It will be stored in the value of the TItem for a node
+typedef struct absent_keys {
+    Key * k;
+    struct absent_keys* next;
+}absent_keys_t;
+#endif
 
 template <typename T, typename W = TWrapped<T>>
 class TART : public Tree, TObject {
@@ -70,10 +95,30 @@ class TART : public Tree, TObject {
 
 	static constexpr uintptr_t nodeset_bit = 1LU << 63;
     static constexpr uintptr_t bloom_validation_bit = 1LU << 62;
-	
+    static constexpr uintptr_t keyset_bit = 1LU <<61;
+
+    bool compacted=false;
+
 public:
-    
-	TART(LoadKeyFunction loadKeyFun) : Tree(loadKeyFun) { }
+
+    TART(LoadKeyFunction loadKeyFun) : TART(loadKeyFun, false) {
+    }
+
+	TART(LoadKeyFunction loadKeyFun, bool comp) : Tree(loadKeyFun), compacted(comp) {
+        #if MEASURE_ABORTS == 1
+            bzero(aborts, nthreads * aborts_sz * sizeof(uint64_t));
+            aborts_descr[0] = "nodeset validation failure";
+            aborts_descr[1] = "bloomset validation failure";
+            aborts_descr[2] = "STO version mismatch";
+            aborts_descr[3] = "failure in lock";
+            aborts_descr[4] = "record is poisoned";
+            aborts_descr[5] = "update AVN failure - update key";
+            aborts_descr[6] = "update AVN failure - insert key, failure while updating node 1";
+            aborts_descr[7] = "update AVN failure - insert key, failure while updating node 2";
+            aborts_descr[8] = "abort exception handled (hard opacity check, etc.)";
+            aborts_descr[9] = "key inserted concurrently";
+        #endif
+    }
 
 	typedef struct record {
 		// TODO: We might not need to store key here!
@@ -116,42 +161,64 @@ public:
     }
 
 	lookup_res t_lookup(const Key& k, ThreadInfo& threadEpocheInfo){
-		return t_lookup( k, threadEpocheInfo, true);
+		return t_lookup(k, threadEpocheInfo, true);
 	}
 
 	lookup_res t_lookup(const Key& k, ThreadInfo& threadEpocheInfo, bool validate){
-		PRINT_DEBUG("Lookup key %s\n", keyToStr(k).c_str())
+        PRINT_DEBUG("Lookup key %s\n", keyToStr(k).c_str())
 		trans_info* t_info = new trans_info();
 		memset(t_info, 0, sizeof(trans_info));
-		TID tid = lookup(k, threadEpocheInfo, t_info);
+        TID tid = lookup(k, threadEpocheInfo, t_info);
+        #if MEASURE_ART_NODE_ACCESSES == 1
+        if(validate){
+            accessed_nodes_sum+=t_info->accessed_nodes;
+            accessed_nodes_num++;
+        }
+        #endif
 		if(t_info->check_key){ // call the TART check Key! (casting from rec*)
-			tid = checkKeyFromRec(tid, k);
+            tid = checkKeyFromRec(tid, k);
 		}
-		if (tid == 0){ // not found. Add parent in the node set!
+		if (tid == 0){ // not found. Add parent in the nodeset, or key in keyset
             PRINT_DEBUG("Not found!\n")
-			ns_add_node(std::get<0>(t_info->updated_node1), std::get<1>(t_info->updated_node1));
-			return lookup_res(0, true);
+            if(validate){ // only add parent in the nodeset if we want to validate (TART RW, not TART compacted)
+                #if ABSENT_VALIDATION == 1
+                ns_add_node(std::get<0>(t_info->updated_node1), std::get<1>(t_info->updated_node1));
+                #elif ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+                ns_add_node(t_info->cur_node, k);
+                #elif ABSENT_VALIDATION == 4
+                ks_add_key(k);
+                #endif
+            }
+            delete t_info;
+            return lookup_res(0, true);
 		}
 		record* rec = reinterpret_cast<record*>(tid);
+        delete t_info;
         if(validate) {
             auto item = Sto::item(this, rec);
+            if(!rec->valid() && !has_insert(item)){
+                INCR(aborts[TThread::id()][4])
+                goto abort;
+            }
 			if(has_delete(item)){ // current transaction already marked for deletion, reply as it is absent!
-				return lookup_res(0, true);
+                return lookup_res(0, true);
 			}
 			// add to read set
 			item.observe(rec->version);
             //item.add_read(rec->version);
         }
 		return lookup_res(rec->val, true);
-		//abort:
-		//	return lookup_res(0, false);
+		abort:
+			return lookup_res(0, false);
 	}
 
+    
+    // ins_res is <inserted, ok-to-commit>, where inserted is true when the new key caused an insertion and false when it was an udpate. ok-to-commit is false when the transaction must abort at run-time.
 	ins_res t_insert(const Key & k, TID tid, ThreadInfo &epocheInfo){
-		trans_info* t_info = new trans_info();
+        trans_info* t_info = new trans_info();
 		memset(t_info, 0, sizeof(trans_info));
 		PRINT_DEBUG("Transactionally Inserting (key:%s, tid:%lu)\n", keyToStr(k).c_str(), tid)
-		insert(k, tid, epocheInfo, t_info); 
+        insert(k, tid, epocheInfo, t_info);
 		N* n = t_info->cur_node;
 		N* l_n = t_info->l_node;
 		N* l_p_n = t_info->l_parent_node;
@@ -159,33 +226,53 @@ public:
         bzero(updated_nodes, 2* sizeof(N*));
         updated_nodes[0] = std::get<0>(t_info->updated_node1);
         updated_nodes[1] = std::get<0>(t_info->updated_node2);
+		uint8_t keyslice = t_info->keyslice;
+
+        #if ABSENT_VALIDATION == 1
         uint64_t updated_nodes_v [2];
         updated_nodes_v[0] = std::get<1>(t_info->updated_node1);
         updated_nodes_v[1] = std::get<1>(t_info->updated_node2);
-		uint8_t keyslice = t_info->keyslice;
-		if(t_info->updatedVal > 0){ // it is an update
+        #endif	
+	
+        if(t_info->updatedVal > 0){ // it is an update
             record* rec = reinterpret_cast<record*>(t_info->prevVal);
             auto item = Sto::item(this, rec);
+            if(!rec->valid() && !has_insert(item)){
+                INCR(aborts[TThread::id()][4])
+                if(t_info->w_unlock_obsolete)
+                    l_n->writeUnlockObsolete();
+                else
+                    l_n->writeUnlock();
+                //stringstream ss;
+                //ss<<TThread::id()<<": Aborting due to update of poisoned key "<<tid<<endl;
+                //cout<<ss.str()<<std::flush;
+                return ins_res(false, false);
+            }
             // update AVN in node set, if exists
             // Use the version number after the unlock! (+2)
+            #if ABSENT_VALIDATION == 1
             if(! ns_update_node_AVN(updated_nodes[0], updated_nodes_v[0], updated_nodes[0]->getVersion()+2)) {
                 PRINT_DEBUG("UPDATE NODE FAIL!\n")
+                INCR(aborts[TThread::id()][5])
                 if(t_info->w_unlock_obsolete)
                     l_n->writeUnlockObsolete();
                 else
                     l_n->writeUnlock();
                 return ins_res(false, false);
             }
-            item.add_write(t_info->updatedVal);
+            #endif
+            //item.add_write(t_info->updatedVal);
             // TODO: In some runs l_n was null! Check it!
             if(t_info->w_unlock_obsolete)
                 l_n->writeUnlockObsolete();
             else
                 l_n->writeUnlock();
-            return ins_res(true, true);
+            delete t_info;
+            return ins_res(false, true);
         }
 
-        // create a poisoned record (invalid bit set)
+        // create a poisoned record (invalid bit set) and store the client provided tid
+        // the actual tid of the ART node will be the record* (casted to TID)
 		record* rec = new record(k, tid, false);
 		PRINT_DEBUG("Creating new record %p with key %s\n", rec, keyToStr(k).c_str())
 		auto item = Sto::item(this, rec);
@@ -204,14 +291,17 @@ public:
                 (static_cast<N256*>(n))->insert(keyslice, N::setLeaf(reinterpret_cast<TID>(rec)));
                  break;
 		}
-		// update AVN in node set, if exists
+        item.add_write();
+        item.add_flags(insert_bit);
+		#if ABSENT_VALIDATION == 1
+        // update AVN in node set, if exists
 		// Include the +2 version number increment that happens at unlock!!
 		// We cannot update the AVN after unlocking, because a concurrent transaction could alter the version number
 		// and we will not detect it!
 		if(! ns_update_node_AVN(updated_nodes[0], updated_nodes_v[0], updated_nodes[0]->getVersion()+2)) {
 			l_n->writeUnlock();
+            INCR(aborts[TThread::id()][6])
             PRINT_DEBUG("UPDATE NODE 1 FAIL!\n")
-            cout<<"UPDATE NODE 1 FAIL!\n";
 			if(l_p_n){
 		  		l_p_n->writeUnlock();
 		  	}
@@ -220,21 +310,49 @@ public:
         if(updated_nodes[1] != nullptr){
             if(! ns_update_node_AVN(updated_nodes[1], updated_nodes_v[1], updated_nodes[1]->getVersion()+2)) {
                 l_n->writeUnlock();
+                INCR(aborts[TThread::id()][7])
                 PRINT_DEBUG("UPDATE NODE 2 FAIL!\n")
-                cout<<"UPDATE NODE 1 FAIL!\n";
                 if(l_p_n){
                     l_p_n->writeUnlock();
                 }
                 goto abort;
             }
         }
-		item.add_write();
-		item.add_flags(insert_bit);
+        #elif ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+        // we must remove that newly inserted key from the current node in the node set, if exists
+        auto nodeset_item = Sto::item(this, get_nodeset_key(n)); //n is t_info->cur_node
+        if(nodeset_item.has_read()){ // remove the newly inserted key from the absent key list!
+            cout <<"Inserting previously absent key\n";
+            absent_keys_t* keys_list_cur = nodeset_item.template read_value<absent_keys_t*>();
+            absent_keys_t* keys_list_prev = keys_list_cur;
+            while(keys_list_cur != nullptr) {
+                cout<<"AA\n";
+                if(keys_list_cur->k == nullptr)
+                    break;
+                if(*keys_list_cur->k == k){ // remove that key
+                    if(keys_list_prev == keys_list_cur){ // found in head of the list
+                        delete keys_list_cur->k;
+                        nodeset_item.update_read(nodeset_item.template read_value<absent_keys_t*>(), keys_list_cur->next); // change head of the list as the next element
+                        delete keys_list_cur;
+                        break;
+                    }
+                    else {
+                        keys_list_prev->next = keys_list_cur->next;
+                        delete keys_list_cur->k;
+                        delete keys_list_cur;
+                        break;
+                    }
+                }
+                keys_list_prev = keys_list_cur;
+                keys_list_cur = keys_list_cur->next;
+            }
+        }
+        #endif
 		PRINT_DEBUG("-- Unlocking node %p\n", l_n);
 		if(t_info->w_unlock_obsolete)
             l_n->writeUnlockObsolete();
         else
-        l_n->writeUnlock();
+            l_n->writeUnlock();
 		if(l_p_n){
 			PRINT_DEBUG("-- Unlocking parent node %p\n", l_p_n);
 			l_p_n->writeUnlock();
@@ -245,9 +363,11 @@ public:
 		//item_tmp = item.item();
 		//rec_tmp = item_tmp.key<record*>();
 		//PRINT_DEBUG("Inserted key %s\n", keyToStr(rec_tmp->key).c_str())
+        delete t_info;
         return ins_res(true, true);
 		abort:
-			return ins_res(false, false);
+            delete t_info;
+			return ins_res(true, false);
 	}
 
 	rem_res t_remove(const Key & k, TID tid, ThreadInfo &threadEpocheInfo){
@@ -260,9 +380,17 @@ public:
             lookup_tid = checkKeyFromRec(lookup_tid, k); 
         }
 		if(lookup_tid == 0){ // not found, add to node set!
-			ns_add_node(std::get<0>(t_info->updated_node1), std::get<1>(t_info->updated_node1));
+			#if ABSENT_VALIDATION == 1
+            ns_add_node(std::get<0>(t_info->updated_node1), std::get<1>(t_info->updated_node1));
+            #elif ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+            ns_add_node(t_info->cur_node, k);
+            #elif ABSENT_VALIDATION == 4
+            ks_add_key(k);
+            #endif
+            delete t_info;
 			return rem_res(false, true);
 		}
+        delete t_info;
 		record* rec = reinterpret_cast<record*>(lookup_tid);
 		if(rec->val != tid){ // that's the behavior of ART insert: If the encountered tuple id is different than the supplied one, return
 			tid_mismatch = true;
@@ -272,7 +400,8 @@ public:
 		}
 		auto item = Sto::item(this, rec);
 		item.observe(rec->version);
-		if(tid_mismatch){
+		//item.add_read(rec->version);
+        if(tid_mismatch){
 			PRINT_DEBUG("Oops, tid mismatch!\n")
 			return rem_res(false, true);
 		}
@@ -282,42 +411,65 @@ public:
 		return rem_res(true, true);
 	}
 
+    #if BLOOM_VALIDATE == 1
+    // for BLOOM_VALIDATE 1
     // add in a separate data structure! Performance is bad when we create a Sto::item per absent bloom filter element
-    void bloom_v_add_key(uint64_t* hashVal){
-        if (( reinterpret_cast<uintptr_t>(hashVal) & bloom_validation_bit ) != 0){
+    void bloom_v_add_hash_key(uint64_t* hashVal){
+        /*if (( reinterpret_cast<uintptr_t>(hashVal) & bloom_validation_bit ) != 0){
             cout<<"Oops, 62nd bit is set!\n";
             cout<<"Oops, hashVal is "<<hashVal<<endl;
         }
         if (( reinterpret_cast<uintptr_t>(hashVal) & nodeset_bit) != 0)
-            cout<<"Oops, 63rd bit is set!\n";
-        auto item = Sto::item(this, get_bloomset_key(hashVal));
+            cout<<"Oops, 63rd bit is set!\n";*/
+        auto item = Sto::item(this, get_bloomset_hash_key(hashVal));
         if(!item.has_read()){
             item.add_read(0);
         }
     }
-
+    #elif BLOOM_VALIDATE == 2
+    // for BLOOM_VALIDATE 2
+    void bloom_v_add_key(TID tid, uint64_t* hashVal){
+        INIT_COUNTING_BLOOM
+        auto item = Sto::item(this, get_bloomset_key(tid));
+        if(!item.has_read()){
+            item.add_read(0);
+            START_COUNTING_BLOOM
+            memcpy(item.item().hashValue, hashVal, 2 * sizeof(uint64_t));
+            STOP_COUNTING_BLOOM("memcpy in TItem")
+        }
+    }
+    #endif
     private:
-    
-    uintptr_t get_bloomset_key(uint64_t* hashVal){
+    #if BLOOM_VALIDATE == 1
+    // for BLOOM_VALIDATE 1
+    uintptr_t get_bloomset_hash_key(uint64_t* hashVal){
         return reinterpret_cast<uintptr_t>(hashVal) | bloom_validation_bit;
     }
-
     uint64_t* get_bloomset_hash_val(uintptr_t b){
         return reinterpret_cast<uint64_t*>(b & ~bloom_validation_bit);
     }
-
+    #elif BLOOM_VALIDATE == 2
+    // for BLOOM_VALIDATE 2
+    uintptr_t get_bloomset_key(TID tid){
+        return reinterpret_cast<uintptr_t>(tid) | bloom_validation_bit;
+    }
+    TID get_bloomset_tid(uintptr_t t){
+        return reinterpret_cast<TID>(t & ~bloom_validation_bit);
+    }
     bool is_in_bloomset(TransItem& item){
         return (item.key<uintptr_t>() & bloom_validation_bit) != 0;
     }
+    #endif
 
-	// Adds a node and its AVN in the node set
-	bool ns_add_node(N* node, uint64_t vers){
+    // For ABSENT_VALIDATION 1
+	#if ABSENT_VALIDATION == 1
+    // Adds a node and its AVN in the node set
+	void ns_add_node(N* node, uint64_t vers){
         auto item = Sto::item(this, get_nodeset_key(node));
         if(!item.has_read()){
             PRINT_DEBUG("Adding node %p to node set with version %lu\n", node, vers)
             item.add_read(vers);
         }
-        return false;
     }
 
 	// Updates the AVN of a node in the node set
@@ -329,25 +481,101 @@ public:
 		PRINT_DEBUG("node %p: AVN before insert:%lu, AVN after insert:%lu, AVN current in node set:%lu\n",
 					n, before_vers, after_vers, item.template read_value<uint64_t>())
 		//TODO: check this!
-        //if(before_vers == item.template read_value<uint64_t>()){
+        if(before_vers == item.template read_value<uint64_t>()){
 			item.update_read(before_vers, after_vers);
 			return true;
-		//}
-		//return false;
+		}
+        // check what happens if we don't abort now, but leave it for commit time
+        //return true;
+		return false;
 	}
+    #endif
+   
+    // For ABSENT_VALIDATION 2, 3
+    #if ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+    bool ns_add_node(N* node, const Key & key){
+        auto item = Sto::item(this, get_nodeset_key(node));
+        //stringstream ss;
+        //ss<<TThread::id()<< ": Adding absent key "<< keyToStr(key) <<endl;
+        //cout<<ss.str();
+        if(!item.has_read()){ // create new absent keys list
+            absent_keys_t* keys_list = new absent_keys_t;
+            bzero(keys_list, sizeof(absent_keys_t));
+            keys_list->k = copy_key(key);
+            //cout<<"Add read!\n";
+            item.add_read(keys_list);
+        }
+        else { // there is already an entry in the node set
+            //cout<<"Has read\n";
+            absent_keys_t* keys_list_before = item.item().template read_value<absent_keys_t*>();
+            absent_keys_t* keys_list = keys_list_before;
+            if(keys_list == nullptr){ // this can be true if we deleted a key due to insert!
+                absent_keys_t* keys_list = new absent_keys_t;
+                bzero(keys_list, sizeof(absent_keys_t));
+                keys_list->k = copy_key(key);
+                //cout<<"Update read!\n";
+                item.update_read(keys_list_before, keys_list);
+            }
+            else {
+                while(keys_list->next != nullptr)
+                    keys_list = keys_list->next;
+                absent_keys_t* new_key = new absent_keys_t;
+                bzero(new_key, sizeof(absent_keys_t));
+                new_key->k = copy_key(key);
+                keys_list->next = new_key;
+                /*unsigned i=1;
+                while(keys_list_before->next != nullptr){
+                    keys_list_before = keys_list_before->next;
+                    i++;
+                }*/
+            }
+        }
+        return true;
+    }
+    #endif
 
-    
-	static uintptr_t get_nodeset_key(N* node) {
-		return reinterpret_cast<uintptr_t>(node) | nodeset_bit;
-	}
-
-	N* get_node(uintptr_t k){
-		return reinterpret_cast<N*>(k & ~nodeset_bit) ;
+    static uintptr_t get_nodeset_key(N* node) {
+        return reinterpret_cast<uintptr_t>(node) | nodeset_bit;
     }
 
-	bool is_in_nodeset(TransItem& item){
-		return (item.key<uintptr_t>() & nodeset_bit) != 0;
-	}
+    bool is_in_nodeset(TransItem& item){
+        return (item.key<uintptr_t>() & nodeset_bit) != 0;
+    }
+
+    N* get_node(uintptr_t k){
+        return reinterpret_cast<N*>(k & ~nodeset_bit) ;
+    }
+
+
+    Key* copy_key(const Key& k){
+        Key* key = new Key;
+        bzero(key, sizeof(Key));
+        key->set((const char*)&k[0], k.getKeyLen());
+        return key;
+    }
+
+    // For ABSENT_VALIDATION 4
+    // Adds a key to the key set
+    #if ABSENT_VALIDATION == 4
+    void ks_add_key(const Key& k){
+        Key* key = copy_key(k);
+        auto item = Sto::item(this, get_keyset_key(key));
+        if(!item.has_read()){
+            item.add_read(0);
+        }
+    }
+    static uintptr_t get_keyset_key(Key* key){
+        return reinterpret_cast<uintptr_t>(key) | keyset_bit;
+    }
+
+    bool is_in_keyset(TransItem& item){
+        return (item.key<uintptr_t>() & keyset_bit) != 0;
+    }
+    
+    Key* get_key(uintptr_t k){
+        return reinterpret_cast<Key*>(k & ~keyset_bit);
+    }
+    #endif
 
 	static bool has_insert(const TransItem& item){
 		return item.flags() & insert_bit;
@@ -362,11 +590,30 @@ public:
      */
 	bool lock(TransItem& item, Transaction& txn){
 		PRINT_DEBUG("Lock\n")
-		assert(!is_in_nodeset(item));
+		#if ABSENT_VALIDATION == 1 || ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+        assert(!is_in_nodeset(item));
+        #elif ABSENT_VALIDATION == 4
+        assert(!is_in_keyset(item));
+        #endif
         record* rec = item.key<record*>();
 		auto res = txn.try_lock(item, rec->version);
+        if(!res){
+            INCR(aborts[TThread::id()][3])
+        }
         return res;
     }
+
+    #if ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+    void clear_absent_keys_list(absent_keys_t* keys_list){
+        absent_keys_t* keys_list_cur;
+        while(keys_list != nullptr){
+            keys_list_cur = keys_list;
+            keys_list = keys_list->next;
+            delete keys_list_cur->k;
+            delete keys_list_cur;
+        }
+    }
+    #endif
 
 	bool check(TransItem& item, Transaction& ){
         INIT_COUNTING
@@ -374,6 +621,7 @@ public:
         START_COUNTING
 		bool okay = false;
         //printf("Is in node set? %u\n", is_in_nodeset(item));
+        #if ABSENT_VALIDATION == 1
         if(is_in_nodeset(item)){
 			N* node = get_node(item.key<uintptr_t>());
 			auto live_vers = node->getVersion();
@@ -381,14 +629,100 @@ public:
             if(live_vers != titem_vers){
                 PRINT_DEBUG("Node set check: node %p version: %lu, TItem version: %lu\n", node, live_vers, titem_vers)
                 PRINT_DEBUG_VALIDATION("VALIDATION FAILED: NODESET\n");
+                INCR(aborts[TThread::id()][0])
             }
             return live_vers == titem_vers;
 		}
-        #if VALIDATE && USE_BLOOM > 0
+        #elif ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+        if(is_in_nodeset(item)){
+            absent_keys_t* keys_list = item.read_value<absent_keys_t*>();
+            unsigned i=0;
+            while(keys_list!= nullptr){
+                if(keys_list->k != nullptr){
+                    trans_info* t_info = new trans_info();
+                    memset(t_info, 0, sizeof(trans_info));
+                    auto t = this->getThreadInfo();
+                    #if ABSENT_VALIDATION == 2
+                    TID tid = lookup(*keys_list->k, t, t_info);
+                    #elif ABSENT_VALIDATION == 3
+                    N* node = get_node(item.key<uintptr_t>());
+                    if(node->isMigrated()) { // node migrated in the meantime! Abort!
+                        return false;
+                    }
+                    TID tid = lookup(*keys_list->k, t, t_info, node);
+                    #endif
+                    if(t_info->check_key){ // call the TART check Key! (casting from rec*)
+                        tid = checkKeyFromRec(tid, *keys_list->k);
+                    }
+                    delete t_info;
+                    if(tid!=0){ // oops, someone else inserted that key! Abort!
+                        record* rec = reinterpret_cast<record*>(tid);
+                        auto found_item = Sto::item(this, rec);
+                        if(!rec->valid() && !has_insert(found_item)){
+                            INCR(aborts[TThread::id()][4])
+                            return false;
+                        }
+                        // add to read set
+                        //found_item.observe(rec->version);
+                        /*stringstream ss;
+                        ss<<TThread::id()<<": Abort! key " << keyToStr(*keys_list->k) <<endl;
+                        cout<<ss.str();*/
+                        clear_absent_keys_list(keys_list);
+                        INCR(aborts[TThread::id()][9])
+                        return false;
+                    }
+                }
+                i++;
+                keys_list = keys_list->next;
+            }
+            clear_absent_keys_list(keys_list);
+            return true;
+        }
+        #elif ABSENT_VALIDATION == 4
+        if(is_in_keyset(item)){
+            Key *k = get_key(item.key<uintptr_t>());
+            trans_info* t_info = new trans_info();
+            memset(t_info, 0, sizeof(trans_info));
+            auto t = this->getThreadInfo();
+            TID tid = lookup(*k, t, t_info);
+            if(t_info->check_key){ // call the TART check Key! (casting from rec*)
+                tid = checkKeyFromRec(tid, *k);
+            }
+            delete t_info;
+            if(tid !=0){ // oops, previously absent key exists now! Did we add it?
+                record* rec = reinterpret_cast<record*>(tid);
+                if(rec->valid() ) { // a concurrent transaction added that key! If it was the current transaction, valid 
+                                    // bit would be false since check phase is before install.
+                    delete k;
+                    INCR(aborts[TThread::id()][9])
+                    //cout<<"Absent node found!\n";
+                    return false;
+                }
+            }
+            delete k;
+            return true;
+        }
+        #endif
+        #if BLOOM_VALIDATE > 0 && USE_BLOOM > 0
         if(is_in_bloomset(item)){
-            uint64_t* hash = get_bloomset_hash_val(item.key<uintptr_t>());
+            INIT_COUNTING_BLOOM
+            uint64_t* hash;
+            #if BLOOM_VALIDATE == 1
+            hash = get_bloomset_hash_val(item.key<uintptr_t>());
+            #elif BLOOM_VALIDATE == 2
+            //TID key = get_bloomset_key(item.key<uintptr_t>());
+            START_COUNTING_BLOOM
+            hash = item.hashValue;
+            STOP_COUNTING_BLOOM("get hashValue from TItem")
+            #endif
+            //TID tid = get_tid(item.key<uintptr_t>());
+            //Key k;
+            //uintptr_t tid_flagged = reinterpret_cast<uintptr_t>(tid | dont_cast_from_rec_bit);
+            //loadKey(reinterpret_cast<TID>(tid_flagged), k);
             if(bloom_contains_hash(hash)){
+            //if(bloom_contains(k.getKey(), k.getKeyLen(), nullptr)){
                 PRINT_DEBUG_VALIDATION("VALIDATION FAILED: BLOOMSET\n");
+                INCR(aborts[TThread::id()][1])
                 return false;
             }
             return true;
@@ -401,23 +735,36 @@ public:
         START_COUNTING
         STOP_COUNTING_PRINT("empty")
         PRINT_DEBUG("Check returns: %u\n", okay)
-        if(!okay)
+        if(!okay){
             PRINT_DEBUG_VALIDATION("VALIDATION FAILED: STO VERSION MISMATCH\n");
+            INCR(aborts[TThread::id()][2])
+        }
         return okay;
     }
 
 	void install(TransItem& item, Transaction& txn){
 		PRINT_DEBUG("Install\n")
-		assert(!is_in_nodeset(item));
+		#if ABSENT_VALIDATION == 1 || ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+        assert(!is_in_nodeset(item));
+        #elif ABSENT_VALIDATION == 4
+        assert(!is_in_keyset(item));
+        #endif
 		record* rec = item.key<record*>();
 		PRINT_DEBUG("Key: %s\n", keyToStr(rec->key).c_str())
 		if(has_delete(item)){
 			PRINT_DEBUG("Has delete bit set!\n");
 			if(!has_insert(item)){
-				assert(rec->valid() && ! rec->deleted);
-				txn.set_version(rec->version);
-				rec->deleted = true;
-				fence();
+				if(rec->deleted)
+                    return;
+                //assert(rec->valid() && ! rec->deleted);
+				// Dimos: For the case that we call delete in the same element!
+				// (Might happen in the test_meme that accesses keys with zipf distribution)
+                assert(rec->valid());
+                if(!rec->deleted){
+                    txn.set_version(rec->version);
+				    rec->deleted = true;
+				    fence();
+                }
 			}
 			return;
 		}
@@ -432,7 +779,11 @@ public:
 
 	void unlock(TransItem& item){
     	PRINT_DEBUG("Unlock\n")
-		assert(!is_in_nodeset(item));
+		#if ABSENT_VALIDATION == 1 || ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+        assert(!is_in_nodeset(item));
+        #elif ABSENT_VALIDATION == 4
+        assert(!is_in_keyset(item));
+        #endif
 		record* rec = item.key<record*>();
 		rec->version.unlock();
 	}
@@ -440,19 +791,26 @@ public:
 	// bool committed
 	void cleanup(TransItem& item, bool committed){
 		PRINT_DEBUG("Cleanup\n")
-		assert(!is_in_nodeset(item));
+		#if ABSENT_VALIDATION == 1 || ABSENT_VALIDATION == 2 || ABSENT_VALIDATION == 3
+        assert(!is_in_nodeset(item));
+        #elif ABSENT_VALIDATION == 4
+        assert(!is_in_keyset(item));
+        #endif
 		record* rec = item.key<record*>();
 		Key k;
-		TID tid = reinterpret_cast<TID>(rec);
-		loadKey(tid, k);
+        TID tid_rec = reinterpret_cast<TID>(rec);
+        // this will load the right key because it casts tid_rec to rec* and gets TID tid = rec->val
+        // tid_rec is not the actual TID, but the rec*, make sure we get the actual TID as rec->val
+        loadKey(tid_rec, k);
 		ThreadInfo epocheInfo = getThreadInfo();
 		if(committed? has_delete(item) : has_insert(item)){
-			// TODO: might need to check the result of remove (if not found)!Even though we check it earlier in t_remove, it might have been removed later
-            remove(k, tid, epocheInfo);
-			Transaction::rcu_delete(rec);
+			// TODO: might need to check the result of remove (if not found)!Even though we check it earlier in t_remove, it might have been removed later. If it has already been removed, we don't have to do anything.
+            // provided tid is the rec* and this is what will be encountered when looking up given key. In order to get the actual tid, we do rec->val.
+            remove(k, tid_rec, epocheInfo);
+            Transaction::rcu_delete(rec);
 		}
 		item.clear_needs_unlock();
-        #if VALIDATE && USE_BLOOM > 0
+        #if BLOOM_VALIDATE == 1 && USE_BLOOM > 0
         if(is_in_bloomset(item)){
             uint64_t* hashVal = get_bloomset_hash_val(item.key<uintptr_t>());
             delete hashVal;
@@ -460,3 +818,4 @@ public:
         #endif
     }
 };
+

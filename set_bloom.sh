@@ -1,12 +1,9 @@
-if [ "$1" == "" ] || [ "$2" == "" ]
+if [ "$1" == "" ]
 then
-    echo "Usage: " $0 "<bloom type>" "<hit ratio mod>"
+    echo "Usage: " $0 "<bloom type>"
     exit
 fi
 
 
-sed -i -r -e "s/#define USE_BLOOM [0-2]+/#define USE_BLOOM $1/" HybridART.hh
-sed -i -r -e "s/#define USE_BLOOM [0-2]+/#define USE_BLOOM $1/" HybridART.hh
-sed -i -r -e "s/#define HIT_RATIO_MOD [0-9]+[0-9]*/#define HIT_RATIO_MOD $2/" test_bloom_txn.cc
-sed -i -r -e "s/#define HIT_RATIO_MOD [0-9]+[0-9]*/#define HIT_RATIO_MOD $2/" test_meme.cc
+sed -i -r -e "s/#define BLOOM [0-2]+/#define BLOOM $1/" test_meme.cc
 

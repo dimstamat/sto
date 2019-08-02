@@ -156,7 +156,13 @@ void singlethreaded(uint64_t n, uint64_t operations_n, unsigned ops_per_txn, uns
 						INIT_COUNTING
 						START_COUNTING
                         uint64_t* hashVal;
-						bool contains = bloom_contains(&key_dat, sizeof(uint64_t), &hashVal);
+						#if BLOOM_VALIDATE == 1
+                        bool contains = bloom_contains(&key_dat, sizeof(uint64_t), &hashVal);
+                        #elif BLOOM_VALIDATE == 0
+                        bool contains = bloom_contains(&key_dat, sizeof(uint64_t), nullptr);
+                        #elif BLOOM_VALIDATE == 2
+                        bool contains = true;
+                        #endif
 						STOP_COUNTING_PRINT("Bloom lookup")
 						if(contains){
 							START_COUNTING
@@ -433,10 +439,10 @@ void multithreaded(uint64_t n, uint64_t operations_n, unsigned ops_per_txn, unsi
 							#if USE_BLOOM
                                 bool contains = false;
 								TID val;
-                                #if VALIDATE
+                                #if BLOOM_VALIDATE == 1
                                     uint64_t * hashVal;
 								    contains = bloom_contains(&key_dat, sizeof(uint64_t), &hashVal);
-                                #else
+                                #elif BLOOM_VALIDATE == 0
                                     contains = bloom_contains(&key_dat, sizeof(uint64_t), nullptr);
                                 #endif
 								if(contains){
@@ -462,8 +468,8 @@ void multithreaded(uint64_t n, uint64_t operations_n, unsigned ops_per_txn, unsi
 									}
 								}
 								else {
-                                    #if VALIDATE
-                                        tree_rw.bloom_v_add_key(hashVal);
+                                    #if BLOOM_VALIDATE
+                                        //tree_rw.bloom_v_add_key(hashVal);
                                     #endif
 									assert(!inRW);
 									START_COUNTING

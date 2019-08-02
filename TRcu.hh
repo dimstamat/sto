@@ -29,6 +29,8 @@ private:
     ~TRcuGroup() {
         while (head_ != tail_) {
             if (e_[head_].function)
+            //Dimos, segfault in some runs when calling free!
+            //if (e_[head_].function && e_[head_].u.argument)
                 e_[head_].function(e_[head_].u.argument);
             ++head_;
         }
