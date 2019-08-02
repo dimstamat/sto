@@ -15,26 +15,28 @@
 
 using namespace std;
 
-const char key_dat [] [10] = { {9, 'A', 'R', 'T'},\
-                             {9, 'A', 'B'},\
-                             {9, 'A', 'C'},\
-                             {9, 'A', 'B', 'B', 'A'},\
-                             {9, 'S', 'T', 'O'},\
+const char key_dat [] [11] = { {3, 'A', 'R', 'T'},\
+                             {2, 'A', 'B'},\
+                             {2, 'A', 'C'},\
+                             {4, 'A', 'B', 'B', 'A'},\
+                             {3, 'S', 'T', 'O'},\
                              {9, 'S', 'T', 'O', 'H', 'A', 'S', 'T', 'I', 'C'},\
-                             {9, 'S', 'T', 'O', 'C', 'K'},\
-                             {9, 'S', 'T', 'E', 'A', 'K'},\
-							 {9, 'S', 'T', 'O', 'L', 'I', 'D', 'I', 'A'},\
-							 {9, 'S', 'T', 'O', 'M', 'A'},\
-							 {9, 'A', 'R', 'T', 'O', 'S'}};
+                             {5, 'S', 'T', 'O', 'C', 'K'},\
+                             {5, 'S', 'T', 'E', 'A', 'K'},\
+							 {8, 'S', 'T', 'O', 'L', 'I', 'D', 'I', 'A'},\
+							 {5, 'S', 'T', 'O', 'M', 'A'},\
+							 {5, 'A', 'R', 'T', 'O', 'S'}};
 
 const char key2_dat [] [10]= {{8, 'A', 'R', 'T', 'I', 'S', 'T', 'I', 'C'},\
 							  {4, 'S', 'T', 'O', 'A'},\
 							  {4, 'C', 'O', 'C', 'O'},\
 							  {4, 'A', 'M', 'A', 'N'},\
 							  {4, 'A', 'U', 'G', 'O'},\
-							  {7, 'A', 'L', 'A', 'B', 'A', 'M', 'A'}};
+							  {7, 'A', 'L', 'A', 'B', 'A', 'M', 'A'},\
+                              {1, 0},\
+                              {1, 'Z'}};
 
-void loadKey(TID tid, Key &key) {
+void loadKeyTART(TID tid, Key &key) {
 	// Store the key of the tuple into the key vector
     // Implementation is database specific
 	// Extract the tid from the record! This is a record *!
@@ -44,52 +46,99 @@ void loadKey(TID tid, Key &key) {
 	key.set(key_dat[actual_tid-1]+1, (unsigned)key_dat[actual_tid-1][0]);
 }
 
+
+void loadKey(TID tid, Key &key){
+    key.set(key_dat[tid-1]+1, (unsigned)key_dat[tid-1][0]);
+}
+
+void loadKey2(TID tid, Key &key){
+    key.set(key2_dat[tid-1]+1, (unsigned)key2_dat[tid-1][0]);
+}
+
+inline string keyToStr(TID tid){
+    std::string res = key_dat[tid-1]+1;
+    return res;
+}
+
 using ins_res = std::tuple<bool,bool>;
 using lookup_res = std::tuple<TID, bool>;
 
 int main() {
-	TART<long> tree(loadKey);
-	//ART_OLC::Tree tree(loadKey);
-	auto t = tree.getThreadInfo();
+	TART<long> tart(loadKeyTART);
+	ART_OLC::Tree tree(loadKey);
+	auto t = tart.getThreadInfo();
+    auto tree_t = tree.getThreadInfo();
 	Key key;
 	{
 		TestTransaction t1(1);
 		// TIDs must start from 1, because checkKey in Tree.cpp returns TID zero when there is no match!
 		for (TID tid=1; tid<=sizeof(key_dat) / sizeof(key_dat[0]); tid++){
         	key.set(key_dat[tid-1]+1, (unsigned)key_dat[tid-1][0]);
-			tree.t_insert(key, tid, t);
-		}
+			tart.t_insert(key, tid, t);
+            cout<<"Inserting "<<keyToStr(tid)<<"\t"<<tid<<endl;
+            tree.insert(key, tid, tree_t);
+        }
 		assert(t1.try_commit());
 	}
 	{
-		TestTransaction t2(2);
+        // remove
+		/*TestTransaction t2(2);
 		for (TID tid=1; tid<=sizeof(key_dat) / sizeof(key_dat[0]); tid++){
 			key.set(key_dat[tid-1]+1, (unsigned)key_dat[tid-1][0]);
-			tree.t_remove(key, tid, t);
-		}
+			tart.t_remove(key, tid, t);
+		}*/
 		/*TID tid = 2;
 		key.set(key_dat[tid-1]+1, (unsigned)key_dat[tid-1][0]);
 		printf("Removing key %s\n", key_dat[tid-1]+1);
-		tree.remove(key, tid, t);
+		tart.remove(key, tid, t);
 		key.set(key_dat[tid-1]+1, (unsigned)key_dat[tid-1][0]);
 		printf("Looking up key %s\n", key_dat[tid-1]+1);
-		TID l_tid = tree.lookup(key, t);
+		TID l_tid = tart.lookup(key, t);
 		if(l_tid == 0)
 			printf("Key %s not found!\n", key_dat[tid-1]+1);
 		*/
-		assert(t2.try_commit());
+		//assert(t2.try_commit());
 	}
 
 	{
+        /*
 		TestTransaction t3(3);
 		TID tid = 3;
 		key.set(key_dat[tid-1]+1, (unsigned)key_dat[tid-1][0]);
 		printf("Looking up key %s\n", key_dat[tid-1]+1);
-        TID l_tid = std::get<0>(tree.t_lookup(key, t));
+        TID l_tid = std::get<0>(tart.t_lookup(key, t));
         if(l_tid == 0)
             printf("Key %s not found!\n", key_dat[tid-1]+1);
 		assert(t3.try_commit());
-	}
+	    */
+    }
+
+    TID tid = 3;
+    key.set(key_dat[tid-1]+1, (unsigned)key_dat[tid-1][0]);
+
+    TID l_tid = tree.lookup(key, tree_t);
+    printf("Lookup of key %s returned %lu\n", key_dat[tid-1]+1, l_tid);
+
+    // lookup range
+    Key key_start, key_end, key_cont;
+    TID tid_start=7, tid_end=8;
+    loadKey2(tid_start, key_start);
+    loadKey2(tid_end, key_end);
+
+    TID result[20];
+
+    std::size_t resultsFound;
+
+    TID res = tree.lookup(key_start, tree_t);
+    cout<<"Lookup of " << key_dat[1]+1 << " returned "<<res<<endl;
+
+    cout<<"Looking up keys ["<< keyToStr(tid_start) <<", "<< keyToStr(tid_end)<<")"<<endl;
+
+    bool l_res = tree.lookupRange(key_start, key_end, key_cont, result, 20, resultsFound, tree_t);
+    for(std::size_t i=0; i<resultsFound; i++){
+        cout<<keyToStr(result[i])<<endl;
+    }
+
 
 
 	/*
@@ -115,14 +164,14 @@ int main() {
 		/*
 		TestTransaction t2(2);
 		key.set(key2_dat[4]+1, (unsigned)key2_dat[4][0]);
-		auto res = tree.t_lookup(key, t);
+		auto res = tart.t_lookup(key, t);
 		printf("Key found? %lu, early abort? %u\n", std::get<0>(res), !std::get<1>(res));
 		key.set(key_dat[5]+1, (unsigned)key_dat[5][0]);
-		res = tree.t_lookup(key, t);
+		res = tart.t_lookup(key, t);
 		printf("Key found? %lu, early abort? %u\n", std::get<0>(res), !std::get<1>(res));
 		TestTransaction t3(3);
 		key.set(key2_dat[5]+1, (unsigned)key2_dat[5][0]);
-		tree.t_insert(key, 5, t);
+		tart.t_insert(key, 5, t);
 		assert(t2.try_commit());
 		assert(t3.try_commit());
 		*/
