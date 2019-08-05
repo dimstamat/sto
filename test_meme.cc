@@ -851,6 +851,8 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
     cout<<"RW size: "<< hART.getTARTSize()<<endl;
     #endif
 
+    hART.merge();
+
     #if REMOVE
 	// Remove R/W
 	{ 
@@ -1066,20 +1068,20 @@ void init_key_accesses(unsigned thread_id, uint64_t rw_size, TID keys_read, bool
 }
 
 int main(int argc, char **argv) {
-	char filename1 [256];
-	char filename2 [256];
+	char init_files [256];
+	char exec_files [256];
     extern char *optarg;
 	extern int optopt;
 	char c;
-	bool f1_set = false, f2_set = false, r_w_set = false, multithreaded=false;
+	bool init_f_set = false, exec_f_set = false, r_w_set = false, multithreaded=false;
 	uint64_t rw_size=0;
 	unsigned insert_ratio=0, ops_per_txn=0;
     float skew_inserts = 0, skew_lookups=0;
 
 	struct option long_opt [] = 
 	{
-		{"file1", required_argument, NULL, 'f'},
-		{"file2", required_argument, NULL, 'g'},
+		{"init-files", required_argument, NULL, 'f'},
+		{"exec-files", required_argument, NULL, 'e'},
 		{"rw-size", required_argument, NULL, 'r'},
 		{"insert-ratio", required_argument, NULL, 'i'},
 		{"ops-per-txn", required_argument, NULL, 'x'},
@@ -1101,15 +1103,15 @@ int main(int argc, char **argv) {
     bzero(latencies_txn_prep, (2*N_THREADS)* sizeof(double));
     #endif
 
-	while((c = getopt_long(argc, argv, ":f:g:r:i:x:t:sm", long_opt, NULL)) != -1){
+	while((c = getopt_long(argc, argv, ":f:e:r:i:x:t:sm", long_opt, NULL)) != -1){
 		switch (c){
 			case 'f':
-				sprintf(filename1, optarg);
-				f1_set = true;
+				sprintf(init_files, optarg);
+				init_f_set = true;
 				break;
-			case 'g':
-				sprintf(filename2, optarg);
-				f2_set = true;
+			case 'e':
+				sprintf(exec_files, optarg);
+				exec_f_set = true;
 				break;
 			case 'r':
 				rw_size = std::stoul(optarg);
@@ -1147,7 +1149,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	if(!f1_set || !r_w_set){
+	if(!init_f_set || !r_w_set){
 		fprintf(stderr, "Missing parameters!\n");
 		exit(-1);
 	}
@@ -1156,7 +1158,16 @@ int main(int argc, char **argv) {
 		exit(-1);
 	}
 
-	std::ifstream file(filename1);
+    char* cur_file;
+    cur_file = strtok(init_files, ",");
+    if(cur_file != nullptr){
+        while((cur_file = strtok(init_files, ",")) != nullptr){
+        }
+    }
+    else { // only one file
+    }
+
+	std::ifstream file(init_files);
 	std::string line;
  
 	while(std::getline(file, line)){
@@ -1172,8 +1183,8 @@ int main(int argc, char **argv) {
 	//TID keys2_read = 1;
 	//if(f2_set && insert_ratio > 0){ // mixed workload
         // let's read from file2 even in lookup-only workload
-    if(f2_set){ 
-		std::ifstream file2(filename2);
+    if(exec_f_set){ 
+		std::ifstream file2(exec_files);
 		std::string line;
 		while(std::getline(file2, line)){
 			if(keys2_read-1 == keys_read) // done, no need to read more keys from file2
@@ -1184,15 +1195,17 @@ int main(int argc, char **argv) {
 				keys2_read++;
 			}
 		}
-		if(keys2_read-1 < keys_read) {
+		/*if(keys2_read-1 < keys_read) {
 			fprintf(stderr, "provided keys from filename2 are less than these of filename1 (%lu vs %lu)\n", keys2_read-1, keys_read);
 			cleanup_keys(keys_read +keys2_read-1);
 			exit(-1);
-		}
+		}*/
 	}
 
 	keys2_read--;
-    cout<<"keys read:" <<(keys_read + keys2_read)<<endl;
+    cout<<"total keys read:" <<(keys_read + keys2_read)<<endl;
+    cout<<"Inserting "<<rw_size<< " in RW\n";
+    cout<<"Inserting "<< keys_read - rw_size <<" in RO\n";
     zipf_inserts = ZipfianGenerator(1, keys_read+keys2_read, skew_inserts);
 	zipf_lookups = ZipfianGenerator(1, keys_read+keys2_read, skew_lookups);
     // ask from RO only!
