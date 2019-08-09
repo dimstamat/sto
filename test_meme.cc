@@ -22,7 +22,7 @@ using namespace std;
 
 
 #if MULTITHREADED == 1
-const unsigned ops_per_thread=1000000;
+const unsigned ops_per_thread=4000000;
 // number of execution threads, including the main thread
 //const int N_THREADS = 20;
 // now defined in Tree.h as N_THREADS
@@ -37,7 +37,7 @@ const unsigned ops_per_thread=20000000;
 
 #define GUARDED if (TransactionGuard tguard{})
 
-#define NUM_KEYS_MAX 20000000 // 20M keys max
+#define NUM_KEYS_MAX 40000000 // 40M keys max
 
 
 #define HIT_RATIO_MOD 2
@@ -45,7 +45,6 @@ const unsigned ops_per_thread=20000000;
 // note that new inserts during the benchmark are inserted in the RW, even though the key range is beyond the initial RW.
 
 #define REMOVE 1
-
 #define BLOOM 2
 
 #include "Zipfian_generator.hh"
@@ -62,8 +61,6 @@ const unsigned ops_per_thread=20000000;
 ZipfianGenerator zipf_inserts, zipf_lookups, zipfRO_inserts, zipfRO_lookups;
 
 bool runZipf = false;
-
-TID keys_read=1, keys2_read=1;
 
 char * key_dat [NUM_KEYS_MAX];
 
@@ -177,7 +174,7 @@ inline bool do_insert(unsigned thread_id, uint64_t i, ThreadInfo& t, bool insert
     Key key;
     loadKeyInit(i, key);
     if(insert_rw){
-	    ins_res res = hART.insert(key, i, t, b_insert); 
+	    ins_res res = hART.insert(key, i, t, b_insert, thread_id); 
         if(!std::get<1>(res)) // abort the transaction
             return false;
     }
@@ -848,7 +845,7 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
     }
 
     #if MEASURE_TREE_SIZE == 1
-    cout<<"RW size: "<< hART.getTARTSize()<<endl;
+    cout<<"RW size: "<< (double)hART.getTARTSize() / 1024 / 1024 <<endl;
     #endif
 
     hART.merge();
@@ -1004,7 +1001,7 @@ std::unordered_map<uint64_t, uint64_t> rw_lookups_m, ro_lookups_m, off_lookups_m
 
 std::mutex m_lock;
 
-void init_key_accesses(unsigned thread_id, uint64_t rw_size, TID keys_read, bool lookupsOnly){
+void init_key_accesses(unsigned thread_id, uint64_t rw_size, uint64_t keys_read, bool lookupsOnly){
     (void)rw_size;
     (void)keys_read;
     srand(time(nullptr));
@@ -1065,6 +1062,25 @@ void init_key_accesses(unsigned thread_id, uint64_t rw_size, TID keys_read, bool
         #endif
     }
 
+}
+
+uint64_t read_keys_from_file(string file_name, uint64_t key_offset, uint64_t rw_size){
+    std::ifstream file(file_name);
+    std::string line;
+    uint64_t keys_read=0;
+    
+    while(std::getline(file, line)){
+        if(line.rfind("P", 0) == 0){
+            line = line.replace(0, 2, "");
+            keys_read++;
+            //if (key_offset == keys_read){
+                //keys_read--;
+                //break;
+            //}
+            addKeyStr(key_offset + keys_read, line.c_str(), key_offset + keys_read <= rw_size);
+        }
+    }
+    return keys_read;
 }
 
 int main(int argc, char **argv) {
@@ -1159,79 +1175,42 @@ int main(int argc, char **argv) {
 	}
 
     char* cur_file;
+    uint64_t init_keys_read=0, exec_keys_read=0;
     cur_file = strtok(init_files, ",");
-    if(cur_file != nullptr){
-        while((cur_file = strtok(init_files, ",")) != nullptr){
+    while(cur_file != nullptr){
+        cout<<"Reading from "<< cur_file<<endl;
+        init_keys_read += read_keys_from_file(cur_file, 0, rw_size);
+        cur_file = strtok(nullptr, ",");
+    }
+
+    if(exec_f_set){
+        cur_file = strtok(exec_files, ",");
+        while(cur_file != nullptr){
+            cout<<"Reading from "<<cur_file<<endl;
+            exec_keys_read += read_keys_from_file(cur_file, init_keys_read+exec_keys_read, rw_size);
+            cur_file = strtok(nullptr, ",");
         }
-    }
-    else { // only one file
-    }
-
-	std::ifstream file(init_files);
-	std::string line;
- 
-	while(std::getline(file, line)){
-		if(line.rfind("P", 0) == 0){
-			line = line.replace(0, 2, "");
-			//cout <<line<<endl;
-			addKeyStr(keys_read, line.c_str(), keys_read <= rw_size);
-			keys_read++;
-		}
-	}
-	keys_read--;
-	// because we started from 1 (since TIDs must be > 0)
-	//TID keys2_read = 1;
-	//if(f2_set && insert_ratio > 0){ // mixed workload
-        // let's read from file2 even in lookup-only workload
-    if(exec_f_set){ 
-		std::ifstream file2(exec_files);
-		std::string line;
-		while(std::getline(file2, line)){
-			if(keys2_read-1 == keys_read) // done, no need to read more keys from file2
-				break;
-			if(line.rfind("P", 0) == 0){
-				line = line.replace(0, 2, "");
-				addKeyStr(keys_read+keys2_read, line.c_str(), (keys_read + keys2_read) <= rw_size);
-				keys2_read++;
-			}
-		}
-		/*if(keys2_read-1 < keys_read) {
-			fprintf(stderr, "provided keys from filename2 are less than these of filename1 (%lu vs %lu)\n", keys2_read-1, keys_read);
-			cleanup_keys(keys_read +keys2_read-1);
-			exit(-1);
-		}*/
 	}
 
-	keys2_read--;
-    cout<<"total keys read:" <<(keys_read + keys2_read)<<endl;
+    cout<<"total keys read:" <<(init_keys_read + exec_keys_read) <<", init keys: "<< init_keys_read << ", exec keys: "<< exec_keys_read <<endl;
     cout<<"Inserting "<<rw_size<< " in RW\n";
-    cout<<"Inserting "<< keys_read - rw_size <<" in RO\n";
-    zipf_inserts = ZipfianGenerator(1, keys_read+keys2_read, skew_inserts);
-	zipf_lookups = ZipfianGenerator(1, keys_read+keys2_read, skew_lookups);
+    cout<<"Inserting "<< init_keys_read - rw_size <<" in RO\n";
+    zipf_inserts = ZipfianGenerator(1, init_keys_read+exec_keys_read, skew_inserts);
+	zipf_lookups = ZipfianGenerator(1, init_keys_read+exec_keys_read, skew_lookups);
     // ask from RO only!
-    // TODO: use rw_size, instead of hardcoded 700,001
-    zipfRO_inserts = ZipfianGenerator(700001, keys_read+keys2_read, skew_inserts);
-    zipfRO_lookups = ZipfianGenerator(700001, keys_read+keys2_read, skew_lookups);
+    zipfRO_inserts = ZipfianGenerator(rw_size+1, init_keys_read+exec_keys_read, skew_inserts);
+    zipfRO_lookups = ZipfianGenerator(rw_size+1, init_keys_read+exec_keys_read, skew_lookups);
     cout<<"Generated zipf distribution of "<<zipf_inserts.getItems()<<" numbers for inserts\n";
     cout<<"Storing key accesses\n";
     for (unsigned i=0; i<thread_pool_sz; i++){
-        thread_pool[i] = std::thread(init_key_accesses, i+1, rw_size, keys_read, insert_ratio == 0);
+        thread_pool[i] = std::thread(init_key_accesses, i+1, rw_size, init_keys_read, insert_ratio == 0);
     }
-    init_key_accesses(0, rw_size, keys_read, insert_ratio == 0);
+    init_key_accesses(0, rw_size, init_keys_read, insert_ratio == 0);
     for (unsigned i=0; i<thread_pool_sz; i++){
         thread_pool[i].join();
     }
     cout<<"Running bench with insert ratio "<< insert_ratio <<endl;
-    run_bench(keys_read, rw_size, insert_ratio, ops_per_txn, keys_read+1, multithreaded);
-    /*auto t = tree_rw.getThreadInfo();
-    TRANSACTION {
-     do_insert(1, tree_rw, tart_rw, t, true, true);
-     do_insert(2, tree_rw, tart_rw, t, true, true);
-     do_insert(3, tree_rw, tart_rw, t, true, true);
-     do_insert(4, tree_rw, tart_rw, t, true, true);
-     do_insert(5, tree_rw, tart_rw, t, true, true);
-    } RETRY(false);
-    Transaction::print_stats();*/
+    run_bench(init_keys_read, rw_size, insert_ratio, ops_per_txn, init_keys_read+1, multithreaded);
     #if MEASURE_KEY_ACCESSES == 1
     uint64_t rw_lookups=0, ro_lookups=0, off_lookups=0, rw_inserts=0, ro_inserts=0, off_inserts=0;
     double rw_lookup_freq=0, ro_lookup_freq=0, off_lookup_freq=0, rw_insert_freq=0,  ro_insert_freq=0,  off_insert_freq=0; // count the average frequency of key accesses
@@ -1280,6 +1259,6 @@ int main(int argc, char **argv) {
     #endif
     cout<<"RW Keys total (GB): "<< ((double)rw_key_bytes_total) / 1024 / 1024 / 1024 <<endl;
     cout<<"RO Keys total (GB): "<< ((double)ro_key_bytes_total) / 1024 / 1024 / 1024 <<endl;
-	cleanup_keys(keys_read + keys2_read);
+	cleanup_keys(init_keys_read + exec_keys_read);
     return 0;
 }
