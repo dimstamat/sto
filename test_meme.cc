@@ -41,11 +41,11 @@ const unsigned ops_per_thread=20000000;
 
 
 #define HIT_RATIO_MOD 2
-#define FULL_RANGE_ZIPF 1 // 1 for full range, 2 for 50% of accesses in full range and 50% in RO range only, 3 for RO range only
+#define FULL_RANGE_ZIPF 1 // 1 for full range, 2 for 50% of accesses in full range and 50% in RO range only, 3 for RO range only, 4 for RW only
 // note that new inserts during the benchmark are inserted in the RW, even though the key range is beyond the initial RW.
 
 #define REMOVE 1
-#define BLOOM 2
+#define BLOOM 0
 
 #include "Zipfian_generator.hh"
 
@@ -57,8 +57,7 @@ const unsigned ops_per_thread=20000000;
 #define MEASURE_KEY_ACCESSES 0
 
 
-
-ZipfianGenerator zipf_inserts, zipf_lookups, zipfRO_inserts, zipfRO_lookups;
+ZipfianGenerator zipf_inserts, zipf_lookups, zipfRW_inserts, zipfRO_inserts, zipfRO_lookups;
 
 bool runZipf = false;
 
@@ -1001,7 +1000,7 @@ std::unordered_map<uint64_t, uint64_t> rw_lookups_m, ro_lookups_m, off_lookups_m
 
 std::mutex m_lock;
 
-void init_key_accesses(unsigned thread_id, uint64_t rw_size, uint64_t keys_read, bool lookupsOnly){
+void init_key_accesses(unsigned thread_id, uint64_t rw_size, uint64_t keys_read, bool lookupsOnly, unsigned bucket_size){
     (void)rw_size;
     (void)keys_read;
     srand(time(nullptr));
@@ -1045,7 +1044,9 @@ void init_key_accesses(unsigned thread_id, uint64_t rw_size, uint64_t keys_read,
             if(key_ind_insert <= rw_size){
                 m_lock.lock();
                 //the first insert will initialize the counter with zero
-                rw_inserts_m[key_ind_insert]++;
+                //rw_inserts_m[key_ind_insert]++;
+                // measure for 1000-sized buckets
+                rw_inserts_m[(key_ind_insert-1)/bucket_size]++;
                 m_lock.unlock();
             }
             else if(key_ind_insert <=keys_read){
@@ -1198,14 +1199,17 @@ int main(int argc, char **argv) {
     zipf_inserts = ZipfianGenerator(1, init_keys_read+exec_keys_read, skew_inserts);
 	zipf_lookups = ZipfianGenerator(1, init_keys_read+exec_keys_read, skew_lookups);
     // ask from RO only!
-    zipfRO_inserts = ZipfianGenerator(rw_size+1, init_keys_read+exec_keys_read, skew_inserts);
-    zipfRO_lookups = ZipfianGenerator(rw_size+1, init_keys_read+exec_keys_read, skew_lookups);
+    //zipfRO_inserts = ZipfianGenerator(rw_size+1, init_keys_read+exec_keys_read, skew_inserts);
+    //zipfRO_lookups = ZipfianGenerator(rw_size+1, init_keys_read+exec_keys_read, skew_lookups);
+    //zipfRW_inserts = ZipfianGenerator(1, rw_size, skew_inserts);
     cout<<"Generated zipf distribution of "<<zipf_inserts.getItems()<<" numbers for inserts\n";
+    //cout<<"Generated zipf distribution of "<<zipfRW_inserts.getItems()<<" numbers for RW inserts\n";
     cout<<"Storing key accesses\n";
+    unsigned bucket_size = 100;
     for (unsigned i=0; i<thread_pool_sz; i++){
-        thread_pool[i] = std::thread(init_key_accesses, i+1, rw_size, init_keys_read, insert_ratio == 0);
+        thread_pool[i] = std::thread(init_key_accesses, i+1, rw_size, init_keys_read, insert_ratio == 0, bucket_size);
     }
-    init_key_accesses(0, rw_size, init_keys_read, insert_ratio == 0);
+    init_key_accesses(0, rw_size, init_keys_read, insert_ratio == 0, bucket_size);
     for (unsigned i=0; i<thread_pool_sz; i++){
         thread_pool[i].join();
     }
@@ -1235,8 +1239,11 @@ int main(int argc, char **argv) {
     cout<<"RO avg key lookup frequency: "<<ro_lookup_freq<<endl;
     cout<<"Off avg key lookup frequency: "<<off_lookup_freq<<endl;
     if(insert_ratio>0){
-        for(const auto &insert : rw_inserts_m){
+        /*for(const auto &insert : rw_inserts_m){
             rw_inserts += insert.second;
+        }*/
+        for(unsigned bucket_num=0; bucket_num < (rw_size / bucket_size); bucket_num++){
+            cout<<"["<< ((bucket_num * bucket_size) +1) << ", "<< ((bucket_num*bucket_size) + bucket_size) <<"]: "<< fixed << setprecision(2)<< (( rw_inserts_m[bucket_num] / (float) (ops_per_thread * N_THREADS) )* 100) <<endl;
         }
         for(const auto &insert : ro_inserts_m){
             ro_inserts += insert.second;
@@ -1245,14 +1252,14 @@ int main(int argc, char **argv) {
         for(const auto &insert : off_inserts_m){
             off_inserts += insert.second;
         }
-        rw_insert_freq = rw_inserts_m.size() > 0 ? ((double)rw_inserts / rw_inserts_m.size()) : 0;
+        //rw_insert_freq = rw_inserts_m.size() > 0 ? ((double)rw_inserts / rw_inserts_m.size()) : 0;
         ro_insert_freq = ro_inserts_m.size() > 0 ? ((double)ro_inserts / ro_inserts_m.size()) : 0;
         off_insert_freq = off_inserts_m.size() > 0 ? ((double)off_inserts / off_inserts_m.size()) : 0;
 
-        cout<<"RW inserts: "<<rw_inserts<<endl;
+        //cout<<"RW inserts: "<<rw_inserts<<endl;
         cout<<"RO inserts: "<<ro_inserts<<endl;
         cout<<"Off inserts: "<<off_inserts<<endl;
-        cout<<"RW avg key insert frequency: "<<rw_insert_freq<<endl;
+        //cout<<"RW avg key insert frequency: "<<rw_insert_freq<<endl;
         cout<<"RO avg key insert frequency: "<<ro_insert_freq<<endl;
         cout<<"Off avg key insert frequency: "<<off_insert_freq<<endl;
     }
