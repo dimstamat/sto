@@ -115,7 +115,7 @@ public:
     }
 
 	typedef struct record {
-		// TODO: We might not need to store key here!
+		// DONE: We might not need to store key here!
 		// ART itself does not store actual keys, client is responsible for
 		// TID to key mapping. We can find a key by calling loadKey(tid, key); (supplied key is empty and initialized by loadKey)
 		//Key key;
@@ -241,16 +241,13 @@ public:
             auto item = Sto::item(this, rec);
             if(!rec->valid() && !has_insert(item)){
                 INCR(aborts[TThread::id()][4])
-                if(t_info->w_unlock_obsolete)
-                    l_n->writeUnlockObsolete();
-                else
-                    l_n->writeUnlock();
                 delete t_info;
                 return ins_res(false, false);
             }
+            // UPDATE: We do not need to update AVN in node set as it was an update and thus AVN didn't change!
             // update AVN in node set, if exists
             // Use the version number after the unlock! (+2)
-            #if ABSENT_VALIDATION == 1
+            /*#if ABSENT_VALIDATION == 1
             if(! ns_update_node_AVN(updated_nodes[0], updated_nodes_v[0], updated_nodes[0]->getVersion()+2)) {
                 PRINT_DEBUG("UPDATE NODE FAIL!\n")
                 INCR(aborts[TThread::id()][5])
@@ -262,12 +259,9 @@ public:
                 return ins_res(false, false);
             }
             #endif
+            */
             item.add_write(t_info->updatedVal);
             // TODO: In some runs l_n was null! Check it!
-            if(t_info->w_unlock_obsolete)
-                l_n->writeUnlockObsolete();
-            else
-                l_n->writeUnlock();
             delete t_info;
             return ins_res(false, true);
         }
