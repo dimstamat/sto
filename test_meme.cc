@@ -31,7 +31,7 @@ const unsigned ops_per_thread=20000000;
 //const int N_THREADS = 1; 
 #endif
 
-#include "HybridART.hh"
+#include "ExtendedART.hh"
 
 #include "ARTSynchronized/OptimisticLockCoupling/Tree.h"
 
@@ -41,15 +41,11 @@ const unsigned ops_per_thread=20000000;
 
 
 #define HIT_RATIO_MOD 2
-#define FULL_RANGE_ZIPF 1 // 1 for full range, 2 for 50% of accesses in full range and 50% in RO range only, 3 for RO range only, 4 for RW only
-// note that new inserts during the benchmark are inserted in the RW, even though the key range is beyond the initial RW.
 
 #define REMOVE 1
 #define BLOOM 0
 
 #include "Zipfian_generator.hh"
-
-#define PRINT_FALSE_POSITIVES 0
 
 #define MEASURE_ELAPSED_TIME 0
 #define MEASURE_WITH_STEADY_STATE 0
@@ -57,7 +53,7 @@ const unsigned ops_per_thread=20000000;
 #define MEASURE_KEY_ACCESSES 0
 
 
-ZipfianGenerator zipf_inserts, zipf_lookups, zipfRW_inserts, zipfRO_inserts, zipfRO_lookups;
+ZipfianGenerator zipf_inserts, zipf_lookups;
 
 bool runZipf = false;
 
@@ -73,11 +69,10 @@ std::thread thread_pool[thread_pool_sz];
 uint64_t txns_info_arr [N_THREADS][2] __attribute__((aligned(128)));
 
 #if MEASURE_LATENCIES > 0
-double latencies_rw_lookup_found [N_THREADS][2] __attribute__((aligned(128)));
-double latencies_rw_lookup_not_found [N_THREADS][2] __attribute__((aligned(128)));
-double latencies_compacted_lookup [N_THREADS][2] __attribute__((aligned(128)));
-double latencies_rw_insert [N_THREADS][2] __attribute__((aligned(128)));
-double latencies_rw_remove [N_THREADS][2] __attribute__((aligned(128)));
+double latencies_lookup_found [N_THREADS][2] __attribute__((aligned(128)));
+double latencies_lookup_not_found [N_THREADS][2] __attribute__((aligned(128)));
+double latencies_insert [N_THREADS][2] __attribute__((aligned(128)));
+double latencies_remove [N_THREADS][2] __attribute__((aligned(128)));
 double latencies_commit [N_THREADS][2] __attribute__((aligned(128)));
 double latencies_bloom_contains [N_THREADS][2] __attribute__((aligned(128)));
 double latencies_bloom_insert [N_THREADS][2] __attribute__((aligned(128)));
@@ -85,8 +80,8 @@ double latencies_txn_prep [N_THREADS][2] __attribute__((aligned(128)));
 #endif
 
 #if MEASURE_LATENCIES == 2
-int latencies_raw_rw_lookup_found [N_THREADS][ops_per_thread];
-int latencies_raw_rw_lookup_not_found [N_THREADS][ops_per_thread];
+int latencies_raw_lookup_found [N_THREADS][ops_per_thread];
+int latencies_raw_lookup_not_found [N_THREADS][ops_per_thread];
 #endif
 
 
@@ -100,18 +95,17 @@ void loadKeyInit(TID tid, Key& key){
 	key.set(key_dat[tid-1], strlen(key_dat[tid-1]));
 }
 
-uint64_t rw_key_bytes_total=0;
-uint64_t ro_key_bytes_total=0;
+uint64_t key_bytes_init=0, key_bytes_exec=0;
 
-void addKeyStr(TID tid, const char* key_str, bool rw){
+void addKeyStr(TID tid, const char* key_str, bool init){
     if ((key_dat[tid-1] = (char*) malloc((strlen(key_str)+1)*sizeof(char))) == nullptr) {
 		fprintf(stderr, "Malloc returned null!\n");
 		exit(-1);
 	}
-    if(rw)
-        rw_key_bytes_total+=strlen(key_str)+1;
+    if(init)
+        key_bytes_init+=strlen(key_str)+1;
     else
-        ro_key_bytes_total+=strlen(key_str)+1;
+        key_bytes_exec+=strlen(key_str)+1;
     memcpy(key_dat[tid-1], key_str, strlen(key_str)+1);
 	//strcpy(key_dat[tid-1], key_str);
 }
@@ -145,11 +139,11 @@ inline void checkVal(TID val, uint64_t tid){
   	}
 }
 #if BLOOM == 0
-HybridART<uint64_t, DoubleLookup> hART(loadKey, loadKeyTART);
+ExtendedART<uint64_t, DoubleLookup> eART(loadKeyTART);
 #elif BLOOM == 1
-HybridART<uint64_t, BloomNoPacking> hART(loadKey, loadKeyTART);
+ExtendedART<uint64_t, BloomNoPacking> eART(loadKeyTART);
 #elif BLOOM == 2
-HybridART<uint64_t, BloomPacking> hART(loadKey, loadKeyTART);
+ExtendedART<uint64_t, BloomPacking> eART(loadKeyTART);
 #endif
 
 
@@ -168,79 +162,53 @@ inline void set_affinity(std::thread& t, unsigned i){
 bool initial_build_done = false;
 
 
-inline bool do_insert(unsigned thread_id, uint64_t i, ThreadInfo& t, bool insert_rw, bool b_insert){
+inline bool do_insert(unsigned thread_id, uint64_t i, ThreadInfo& t){
 	(void)thread_id; // to avoid compiler warnings for unused variable
     Key key;
+    bool b_insert=true; // always insert to BF for now
     loadKeyInit(i, key);
-    if(insert_rw){
-	    ins_res res = hART.insert(key, i, t, b_insert, thread_id); 
-        if(!std::get<1>(res)) // abort the transaction
-            return false;
-    }
-    else{
-        hART.ro_insert(key, i, t);
-    }
+    ins_res res = eART.insert(key, i, t, b_insert, thread_id); 
+    if(!std::get<1>(res)) // abort the transaction
+        return false;
     return true;
 }
 
-inline bool do_remove(unsigned thread_id, uint64_t i, ThreadInfo& t, bool rw_remove){
+inline bool do_remove(unsigned thread_id, uint64_t i, ThreadInfo& t){
     (void)thread_id; // to avoid compiler warnings for unused variable
     Key key;
     loadKeyInit(i, key);
-    if(rw_remove){
-        rem_res res = hART.remove(key, i, t);
-        if(!std::get<1>(res)) // abort the transaction
-            return false;
-    }
-    else{
-        hART.ro_remove(key, i, t);
-    }
+    rem_res res = eART.remove(key, i, t);
+    if(!std::get<1>(res)) // abort the transaction
+        return false;
     return true;
 }
 
 
 #if MEASURE_ELAPSED_TIME == 1
-double time_b_contains=0, time_b_validation_add_key=0, time_rw_lookup=0, time_compacted_lookup=0;
+double time_b_contains=0, time_b_validation_add_key=0, time_lookup=0;
 #endif
 
 
-inline bool do_lookup(unsigned thread_id, uint64_t i, ThreadInfo& t_rw, ThreadInfo& t_ro, uint64_t &num_keys, uint64_t &rw_size, bool check_val){
+inline bool do_lookup(unsigned thread_id, uint64_t i, ThreadInfo& t, bool check_val){
 	(void)thread_id; //to avoid compiler warnings for unused variable
     Key key;
-    uint64_t key_ind = 0;
-    bool inRW = false;
-    if(num_keys != 0 && rw_size != 0) { // simulate a lookup from RW or RO, depending on HIT_RATIO_MOD
-        if(i % HIT_RATIO_MOD == 0) { // read from R/W
-		    //key_ind = (i-1) % rw_size + 1;
-            key_ind = ((i / HIT_RATIO_MOD)-1 )% rw_size + 1;
-		    inRW = true;
-        }
-        else { // read from compacted
-		    key_ind = (i-1) % (num_keys - rw_size) + rw_size + 1;
-        }
-    }
-    else { // just lookup the given index
-        key_ind = i;
-    }
-    loadKeyInit(key_ind, key);
-    
-    lookup_res res = hART.lookup(key, key_ind, t_rw, t_ro, thread_id);
+    loadKeyInit(i, key);
+    lookup_res res = eART.lookup(key, i, t, thread_id);
     if(!std::get<1>(res)) // abort the transaction
         return false;
     auto val = std::get<0>(res);
-    if(check_val) checkVal(val, key_ind);
-    
+    if(check_val) checkVal(val, i);
     return true;
 }
 
-inline void insert_partition(unsigned ops_per_txn, unsigned thread_id, unsigned ind_start, unsigned ind_end, bool rw_insert){
+inline void insert_partition(unsigned ops_per_txn, unsigned thread_id, unsigned ind_start, unsigned ind_end){
     uint64_t cur_txns=0;
     if(ops_per_txn > 0){
         TThread::set_id(thread_id);
         Sto::update_threadid();
     }
     unsigned key_ind = ind_start;
-    auto t = rw_insert?  hART.getTART().getThreadInfo() : hART.getRO().getThreadInfo();
+    auto t = eART.getTART().getThreadInfo();
     //stringstream ss;
     //ss<<"Thread "<<thread_id <<" starting... ind_start: "<< ind_start <<", ind_end: " << ind_end <<endl;
     //cout<<ss.str();
@@ -251,7 +219,7 @@ inline void insert_partition(unsigned ops_per_txn, unsigned thread_id, unsigned 
                 //ss.clear();
                 //ss<<thread_id<<": inserting, key_ind: "<<key_ind<< ", cur_op: "<<cur_op<<endl;
                 //cout<<ss.str();
-                do_insert(thread_id, key_ind, t, rw_insert, true);
+                do_insert(thread_id, key_ind, t);
             }
             first=false;
         }RETRY(true);
@@ -263,19 +231,19 @@ inline void insert_partition(unsigned ops_per_txn, unsigned thread_id, unsigned 
     //cout<<ss.str();
 }
 
-inline void remove_partition(unsigned ops_per_txn, unsigned thread_id, unsigned ind_start, unsigned ind_end, bool rw_remove){
+inline void remove_partition(unsigned ops_per_txn, unsigned thread_id, unsigned ind_start, unsigned ind_end){
    uint64_t cur_txns=0;
     if(ops_per_txn > 0){
         TThread::set_id(thread_id);
         Sto::update_threadid();
     }
     unsigned key_ind = ind_start;
-    auto t = rw_remove?  hART.getTART().getThreadInfo() : hART.getRO().getThreadInfo();
+    auto t = eART.getTART().getThreadInfo();
     while(key_ind < ind_end){
         bool first=true;
         TRANSACTION {
             for (uint64_t cur_op=0; cur_op<ops_per_txn && key_ind < ind_end; cur_op++, key_ind++){
-                do_remove(thread_id, key_ind, t, rw_remove);
+                do_remove(thread_id, key_ind, t);
             }
             first=false;
         }RETRY(true);
@@ -284,17 +252,16 @@ inline void remove_partition(unsigned ops_per_txn, unsigned thread_id, unsigned 
     txns_info_arr[thread_id][0] = cur_txns;
 }
 
-inline void lookup_partition(unsigned ops_per_txn, unsigned thread_id, uint64_t num_keys, uint64_t rw_size, unsigned ind_start, unsigned ind_end){
+inline void lookup_partition(unsigned ops_per_txn, unsigned thread_id, unsigned ind_start, unsigned ind_end){
     uint64_t cur_txns=0;
     TThread::set_id(thread_id);
     Sto::update_threadid();
     unsigned key_ind = ind_start;
-    auto t_rw = hART.getTART().getThreadInfo();
-    auto t_ro = hART.getRO().getThreadInfo();
+    auto t = eART.getTART().getThreadInfo();
     while(key_ind < ind_end){
         TRANSACTION {
             for (uint64_t cur_op=0; cur_op<ops_per_txn && key_ind < ind_end; cur_op++, key_ind++){
-                do_lookup(thread_id, key_ind, t_rw, t_ro, num_keys, rw_size, true);
+                do_lookup(thread_id, key_ind, t, true);
             }
         }RETRY(false);
         cur_txns++;
@@ -317,12 +284,12 @@ void remove_zipf(unsigned ops_per_txn, unsigned thread_id){
         TThread::set_id(thread_id);
         Sto::update_threadid();
     }
-    auto t = hART.getTART().getThreadInfo();
+    auto t = eART.getTART().getThreadInfo();
     while(i<ops_per_thread){
         uint64_t cur_op=0;
         TRANSACTION {
             for (cur_op=0; cur_op<ops_per_txn && i<ops_per_thread; cur_op++){
-                TXN_DO(do_remove(thread_id, key_insert_indexes [thread_id][i+cur_op], t, true))
+                TXN_DO(do_remove(thread_id, key_insert_indexes [thread_id][i+cur_op], t))
             }
         }RETRY(true)
         i+=cur_op;
@@ -331,7 +298,7 @@ void remove_zipf(unsigned ops_per_txn, unsigned thread_id){
 }
 
 // we need to know whether the accesed key is within the new keys or not, so that to add it in the bloom filter or not.
-void insert_lookup_zipf(unsigned ops_per_txn, unsigned thread_id, unsigned insert_ratio_mod, uint64_t new_keys_ind, uint64_t rw_size){
+void insert_lookup_zipf(unsigned ops_per_txn, unsigned thread_id, unsigned insert_ratio_mod, uint64_t new_keys_ind){
     uint64_t cur_txns = 0;
     INIT_COUNTING
     #if MEASURE_ELAPSED_TIME == 1
@@ -344,8 +311,7 @@ void insert_lookup_zipf(unsigned ops_per_txn, unsigned thread_id, unsigned inser
         TThread::set_id(thread_id);
         Sto::update_threadid();
     }
-    auto t_rw = hART.getTART().getThreadInfo();
-    auto t_ro = hART.getRO().getThreadInfo();
+    auto t = eART.getTART().getThreadInfo();
     unsigned i=0;
     while(i<ops_per_thread){
         // periodically check whether we need to merge or not!
@@ -358,26 +324,24 @@ void insert_lookup_zipf(unsigned ops_per_txn, unsigned thread_id, unsigned inser
         #endif
             for (cur_op=0; cur_op<ops_per_txn && i<ops_per_thread; cur_op++){
                 if(insert_ratio_mod > 0 && (cur_op % insert_ratio_mod == 0)){ // insert
-                    // only add in the bloom filter if key index is beyond the rw_size
                     #if TXN_EXCEPTION_HANDLING == 0
-                    TXN_DO(do_insert(thread_id, key_insert_indexes [thread_id][i+cur_op], t_rw, true, key_insert_indexes[thread_id][i+cur_op] > rw_size  /*true*/))
+                    TXN_DO(do_insert(thread_id, key_insert_indexes [thread_id][i+cur_op], t))
                     #elif TXN_EXCEPTION_HANDLING == 1
-                    if(!do_insert(thread_id, key_insert_indexes [thread_id][i+cur_op], t_rw, true, key_insert_indexes[thread_id][i+cur_op] > rw_size)){
+                    if(!do_insert(thread_id, key_insert_indexes [thread_id][i+cur_op], t)){
                         //cout<<"Should abort in insert\n";
                         throw Transaction::Abort();
                     }
                     #endif
-                    //do_insert(thread_id, key_inds_txn[cur_op], tree_rw, tart_rw, t1, true, false);
+                    //do_insert(thread_id, key_inds_txn[cur_op], tree_rw, tart_rw, t1);
                 }
                 else{   // lookup
-                    uint64_t n1=0, n2=0;
                     #if MEASURE_ELAPSED_TIME == 1
                     clock_gettime(CLOCK_MONOTONIC, &starttimeinsert);
                     #endif
                     #if TXN_EXCEPTION_HANDLING == 0
-                    TXN_DO(do_lookup(thread_id, key_lookup_indexes[thread_id][i+cur_op], t_rw, t_ro, n1, n2, (key_lookup_indexes[thread_id][i+cur_op] < new_keys_ind)))
+                    TXN_DO(do_lookup(thread_id, key_lookup_indexes[thread_id][i+cur_op], t, (key_lookup_indexes[thread_id][i+cur_op] < new_keys_ind)))
                     #elif TXN_EXCEPTION_HANDLING == 1
-                    if(!do_lookup(thread_id, key_lookup_indexes[thread_id][i+cur_op], t_rw, t_ro, n1, n2, (key_lookup_indexes[thread_id][i+cur_op] < new_keys_ind))){
+                    if(!do_lookup(thread_id, key_lookup_indexes[thread_id][i+cur_op], t, (key_lookup_indexes[thread_id][i+cur_op] < new_keys_ind))){
                         //cout<<"Should abort in lookup\n";
                         throw Transaction::Abort();
                     }
@@ -399,24 +363,21 @@ void insert_lookup_zipf(unsigned ops_per_txn, unsigned thread_id, unsigned inser
     cout<<"-- LOOKUPS --"<<endl;
     cout<<"-- elapsed time for bloom contains: "<<time_b_contains<<endl;
     cout<<"-- elapsed time for bloom validation add key: "<<time_b_validation_add_key<<endl;
-    cout<<"-- elapsed time for rw lookup: "<<time_rw_lookup<<endl;
-    cout<<"-- elapsed time for compacted lookup: "<<time_compacted_lookup<<endl;
+    cout<<"-- elapsed time for lookup: "<<time_lookup<<endl;
     #endif
 }
 
 
 enum Operation {
-    lookup,
-    insert_rw,
-    insert_compacted,
-    remove_rw,
-    remove_compacted
+    lookup_op,
+    insert_op,
+    remove_op,
 };
 
 // starts the specified number of threads and distributes the work evenly
 // operation: either lookup or insert
 // ops_per_txn: the number of operations per transaction: 0 means non-transactional
-void start_threads(uint64_t range_start, uint64_t range_end, uint64_t num_keys, uint64_t rw_size, Operation op, unsigned ops_per_txn){
+void start_threads(uint64_t range_start, uint64_t range_end, Operation op, unsigned ops_per_txn){
     unsigned ind_start, ind_end;
     uint64_t partition_size = (range_end+1 - range_start) / N_THREADS;
     for(unsigned i=0; i<thread_pool_sz; i++){
@@ -425,30 +386,29 @@ void start_threads(uint64_t range_start, uint64_t range_end, uint64_t num_keys, 
         //stringstream ss;
         //ss<<"Thread "<<(i+1)<<": ["<<ind_start<<", "<<ind_end<<")"<<endl;
         //cout<<ss.str();
-        if(op == lookup)
-            thread_pool[i] = std::thread(lookup_partition, ops_per_txn, i+1, num_keys, rw_size, ind_start, ind_end);
-        else if (op == insert_rw || op == insert_compacted)
-            thread_pool[i] = std::thread(insert_partition, ops_per_txn, i+1, ind_start, ind_end, op == insert_rw);
+        if(op == lookup_op)
+            thread_pool[i] = std::thread(lookup_partition, ops_per_txn, i+1, ind_start, ind_end);
+        else if (op == insert_op)
+            thread_pool[i] = std::thread(insert_partition, ops_per_txn, i+1, ind_start, ind_end);
         else 
-            thread_pool[i] = std::thread(remove_partition, ops_per_txn, i+1, ind_start, ind_end, op == remove_rw);
+            thread_pool[i] = std::thread(remove_partition, ops_per_txn, i+1, ind_start, ind_end);
         // start from 1 since we reserved CPU 0 for the main thread!
         set_affinity(thread_pool[i], CPUS[i+1]);
     }
 }
 
-void start_threads_mixed(unsigned ops_per_txn, unsigned insert_ratio_mod, uint64_t new_keys_ind, uint64_t rw_size, Operation op){
+void start_threads_mixed(unsigned ops_per_txn, unsigned insert_ratio_mod, uint64_t new_keys_ind, Operation op){
     for(unsigned i=0; i<thread_pool_sz; i++){
-        if(op == Operation::insert_rw)
-            thread_pool[i] = std::thread(insert_lookup_zipf, ops_per_txn, i+1, insert_ratio_mod, new_keys_ind, rw_size);
-        else if(op == Operation::remove_rw)
+        if(op == Operation::insert_op)
+            thread_pool[i] = std::thread(insert_lookup_zipf, ops_per_txn, i+1, insert_ratio_mod, new_keys_ind);
+        else if(op == Operation::remove_op)
             thread_pool[i] = std::thread(remove_zipf, ops_per_txn, i+1);
         // start from 1 since we reserved CPU 0 for the main thread!
         set_affinity(thread_pool[i], CPUS[i+1]);
     }
 }
 
-void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsigned ops_per_txn, uint64_t new_keys_ind, bool multithreaded){
-	rw_size = rw_size > num_keys ? num_keys : rw_size;
+void run_bench(uint64_t num_keys, unsigned insert_ratio, unsigned ops_per_txn, uint64_t new_keys_ind, bool multithreaded){
 	bool transactional = ops_per_txn > 0;
     uint64_t total_txns=0;
     // Make sure that main thread has CPU 0.
@@ -460,22 +420,22 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
         cout<<"Error setting affinity for main thread!\n";
     // Build tree
 	{
-        uint64_t partition_size = rw_size / N_THREADS;
+        uint64_t partition_size = num_keys / N_THREADS;
 		auto starttime = std::chrono::system_clock::now();
 		if(multithreaded && ! transactional){
-            /*start_threads(1, rw_size, num_keys, rw_size, Operation::insert_rw, 0);
+            /*start_threads(1, num_keys, Operation::insert_op, 0);
             uint64_t ind_start = (thread_pool_sz)* partition_size +1;
             uint64_t ind_end = rw_size+1;
-            insert_partition(0, 0, ind_start, ind_end, true);
+            insert_partition(0, 0, ind_start, ind_end);
             for(unsigned i=0; i<thread_pool_sz; i++)
                 thread_pool[i].join();
             */
 		}
 		else if (multithreaded && transactional){
-            start_threads(1, rw_size, num_keys, rw_size, Operation::insert_rw, ops_per_txn);
+            start_threads(1, num_keys, Operation::insert_op, ops_per_txn);
             uint64_t ind_start = (thread_pool_sz)* partition_size +1;
-            uint64_t ind_end = rw_size+1;
-            insert_partition(ops_per_txn, 0, ind_start, ind_end, true);
+            uint64_t ind_end = num_keys+1;
+            insert_partition(ops_per_txn, 0, ind_start, ind_end);
             for(unsigned i=0; i<thread_pool_sz; i++)
                 thread_pool[i].join();
 		}
@@ -483,7 +443,7 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
 		else if (!multithreaded && !transactional){
 			auto t1 = tree_rw.getThreadInfo();
 			for(uint64_t i=1; i<=rw_size; i++){
-				do_insert(0, i, true, true);
+				do_insert(0, i);
 			}
 		}
 		else if (!multithreaded && transactional){
@@ -492,7 +452,7 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
 				GUARDED {
 					for(uint64_t j=1; j<=ops_per_txn; j++){
 						ind = (i-1)*ops_per_txn + j;
-						do_insert(0, ind, true, true);
+						do_insert(0, ind);
 					}
 				}
                 total_txns++;
@@ -501,7 +461,7 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
 				uint64_t limit = rw_size % ops_per_txn;
                 for(uint64_t j=1; j<=limit; j++) { // insert the rest of the keys! (mod)
                     ind++;
-                    do_insert(0, ind, true, true);
+                    do_insert(0, ind);
                 }
                 if(limit>=1)
                     total_txns++;
@@ -517,58 +477,7 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
                 total_txns += txns_info_arr[i][0];
             }
         }
-        printf("insert R/W txn,%ld,%lu,%f\n", rw_size, total_txns, (total_txns * 1.0) / duration.count());
-        // Insert compacted
-        starttime = std::chrono::system_clock::now();
-        if(multithreaded && ! transactional){
-            /*start_threads(rw_size+1, num_keys, num_keys, rw_size, Operation::insert_compacted, 0);
-            uint64_t partition_size = (num_keys - rw_size) / N_THREADS;
-            uint64_t ind_start = thread_pool_sz* partition_size +1;
-            uint64_t ind_end = num_keys+1;
-            insert_partition(0, 0, ind_start, ind_end, false);
-            for(unsigned i=0; i<thread_pool_sz; i++)
-                thread_pool[i].join();
-            */
-        }
-        else if (multithreaded && transactional){
-            start_threads(rw_size+1, num_keys, num_keys, rw_size, Operation::insert_compacted, ops_per_txn);
-            uint64_t partition_size = (num_keys - rw_size) / N_THREADS;
-            uint64_t ind_start = thread_pool_sz* partition_size + + rw_size + 1;
-            uint64_t ind_end = num_keys+1;
-            /* cout<<"Thread 0: ["<<ind_start<<", "<<ind_end<<")"<<endl; */
-            insert_partition(ops_per_txn, 0, ind_start, ind_end, false);
-            for(unsigned i=0; i<thread_pool_sz; i++)
-                thread_pool[i].join();
-        }
-        /*
-        else if (!multithreaded && !transactional){
-			auto t2 = tree_compacted.getThreadInfo();
-			for(uint64_t i=rw_size+1; i<=num_keys; i++){
-				do_insert(0, i, tree_compacted, tart_compacted, t2, false, false);
-            }
-        }
-        else if (!multithreaded && transactional){
-			unsigned ind=0;
-            for (uint64_t i=1; i<= (num_keys - rw_size) / ops_per_txn; i++){
-                GUARDED {
-                    for(uint64_t j=1; j<=ops_per_txn; j++){
-                        ind = rw_size + (i-1)*ops_per_txn + j;
-                        do_insert(0, ind, false, false);
-                    }
-                }
-			}
-			uint64_t limit = (num_keys - rw_size) % ops_per_txn;
-			GUARDED {
-				for(uint64_t j=1; j<=limit; j++) { // insert the rest of the keys! (mod)
-					ind++;
-					do_insert(0, ind, false, false);
-				}
-			}
-        }
-        */
-		duration = std::chrono::duration_cast<std::chrono::microseconds>(
-			std::chrono::system_clock::now() - starttime);
-		printf("insert compacted,%ld,%f\n", num_keys - rw_size+2, ((num_keys - rw_size +2)* 1.0) / duration.count());
+        printf("insert txn,%lu,%f\n", total_txns, (total_txns * 1.0) / duration.count());
     }
     initial_build_done=true;
     Transaction::clear_stats();
@@ -584,18 +493,18 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
         }
         else if (multithreaded && transactional){
             if(lookups_only && ! runZipf){
-                start_threads(1, num_keys, num_keys, rw_size, Operation::lookup, ops_per_txn);
+                start_threads(1, num_keys, Operation::lookup_op, ops_per_txn);
                 uint64_t partition_size = num_keys / N_THREADS;
                 uint64_t ind_start = thread_pool_sz* partition_size +1;
                 uint64_t ind_end = num_keys+1;
                 //cout<<"Thread 0: ["<<ind_start<<", "<<ind_end<<")"<<endl;
-                lookup_partition(ops_per_txn, 0, num_keys, rw_size, ind_start, ind_end);
+                lookup_partition(ops_per_txn, 0, ind_start, ind_end);
                 for(unsigned i=0; i<thread_pool_sz; i++)
                     thread_pool[i].join();
             }
             else { //mixed workload
-                start_threads_mixed(ops_per_txn, insert_ratio_mod, new_keys_ind, rw_size, Operation::insert_rw);
-                insert_lookup_zipf(ops_per_txn, 0, insert_ratio_mod, new_keys_ind, rw_size);
+                start_threads_mixed(ops_per_txn, insert_ratio_mod, new_keys_ind, Operation::insert_op);
+                insert_lookup_zipf(ops_per_txn, 0, insert_ratio_mod, new_keys_ind);
                 for(unsigned i=0; i<thread_pool_sz; i++)
                     thread_pool[i].join();
             }
@@ -604,24 +513,24 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
             /*auto t1 = tree_rw.getThreadInfo();
 			auto t2 = tree_compacted.getThreadInfo();
             if(lookups_only){
-                lookup_partition(0, 0, num_keys, rw_size, 1, num_keys+1);
+                lookup_partition(0, 0, 1, num_keys+1);
             }
             else{
                 insert_lookup_zipf(0, 0, insert_ratio_mod, new_keys_ind, rw_size);
             }*/
             /*for(uint64_t i=1; i<=num_keys; i++){
 				if(! lookups_only && ((i-1) % insert_ratio_mod == 0)) // insert
-                	do_insert(0, i, tree_rw, tart_rw, t1, false, false);
+                	do_insert(0, i, tree_rw, tart_rw, t1);
 				else
-					do_lookup(0, i, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, rw_size, false, true);
+					do_lookup(0, i, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, false, true);
             }*/
         }
         else if (!multithreaded && transactional){
             if(lookups_only && ! runZipf){
-                lookup_partition(ops_per_txn, 0, num_keys, rw_size, 1, num_keys+1);
+                lookup_partition(ops_per_txn, 0, 1, num_keys+1);
             }   
             else{
-                insert_lookup_zipf(ops_per_txn, 0, insert_ratio_mod, new_keys_ind, rw_size);
+                insert_lookup_zipf(ops_per_txn, 0, insert_ratio_mod, new_keys_ind);
             }   
             /*
             unsigned ind=0;
@@ -630,11 +539,11 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
                     for(uint64_t j=1; j<=ops_per_txn; j++){
                         ind = (i-1)*ops_per_txn + j;
                         if(! lookups_only && ((i-1) % insert_ratio_mod == 0)) // insert
-					        //do_insert(0, num_keys+ind, tree_rw, tart_rw, t1, true, true);
+					        //do_insert(0, num_keys+ind, tree_rw, tart_rw, t1);
 					        // try to insert existing key
-					        do_insert(0, ind, tree_rw, tart_rw, t1, true, false);
+					        do_insert(0, ind, tree_rw, tart_rw, t1);
 						else
-						    do_lookup(0, ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, rw_size, true, true);
+						    do_lookup(0, ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, true, true);
                     }
                 }
                 total_txns++;
@@ -644,9 +553,9 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
                 for(uint64_t j=1; j<=limit; j++) { // lookup the rest of the keys! (mod)
                     ind++;
                     if (! lookups_only && ((j-1) % insert_ratio_mod == 0) ) // insert
-                        do_insert(0, ind, tree_rw, tart_rw, t1, true, false);
+                        do_insert(0, ind, tree_rw, tart_rw, t1);
                     else
-                        do_lookup(0, ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, num_keys, rw_size, true, true);
+                        do_lookup(0, ind, tree_rw, tree_compacted, tart_rw, tart_compacted, t1, t2, true, true);
                 }
                 if(limit>=1)
                     total_txns++;
@@ -659,7 +568,19 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
             for(unsigned i=0; i<N_THREADS; i++){
                 total_txns += txns_info_arr[i][0];
             }
-        }        
+        }
+        #if BLOOM == 1 && MEASURE_BF_FALSE_POSITIVES == 1
+            auto FPs = eART.BF_false_positives;
+            int BF_FPs=0, BF_accesses=0;
+            for(unsigned i=0; i<N_THREADS; i++){
+                BF_accesses += FPs[i][0];
+                BF_FPs += FPs[i][1];
+            }
+            cout<<"Bloom Filter Stats:\n";
+            cout<<"False positives: " << BF_FPs<<endl;
+            cout<<"Total accesses: "<< BF_accesses<<endl;
+            cout<<"False positive ratio: "<<std::setprecision(4)<< (double) BF_FPs / BF_accesses<<endl; 
+        #endif
         printf("%s,%ld,%ld,%f (time:%ldsec)\n", (lookups_only? "lookup txn" : "lookup/insert txn" ),  num_ops, total_txns, (total_txns * 1.0) / duration.count(), duration.count()/1000000);
         #if STO_PROFILE_COUNTERS && MEASURE_ABORTS == 1
         Transaction::print_stats();
@@ -671,18 +592,16 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
         }
         #endif
         #if MEASURE_LATENCIES > 0
-            double rw_lookup_not_found = 0, rw_lookup_not_found_num=0, rw_lookup_found = 0, rw_lookup_found_num=0;
-            double compacted_lookup=0, compacted_lookup_num=0, rw_insert = 0, rw_insert_num=0, commit=0, commit_num=0;
+            double lookup_not_found = 0, lookup_not_found_num=0, lookup_found = 0, lookup_found_num=0;
+            double insert = 0, insert_num=0, commit=0, commit_num=0;
             double bloom_contains=0, bloom_contains_num=0, bloom_insert=0, bloom_insert_num=0, txn_prep=0, txn_prep_num=0;
             for(unsigned i=0; i<N_THREADS; i++){
-                rw_lookup_not_found+=latencies_rw_lookup_not_found[i][0];
-                rw_lookup_not_found_num+=latencies_rw_lookup_not_found[i][1];
-                rw_lookup_found+=latencies_rw_lookup_found[i][0];
-                rw_lookup_found_num+=latencies_rw_lookup_found[i][1];
-                compacted_lookup+=latencies_compacted_lookup[i][0];
-                compacted_lookup_num+=latencies_compacted_lookup[i][1];
-                rw_insert+=latencies_rw_insert[i][0];
-                rw_insert_num+=latencies_rw_insert[i][1];
+                lookup_not_found+=latencies_lookup_not_found[i][0];
+                lookup_not_found_num+=latencies_lookup_not_found[i][1];
+                lookup_found+=latencies_lookup_found[i][0];
+                lookup_found_num+=latencies_lookup_found[i][1];
+                insert+=latencies_insert[i][0];
+                insert_num+=latencies_insert[i][1];
                 commit+=latencies_commit[i][0];
                 commit_num+=latencies_commit[i][1];
                 bloom_contains+=latencies_bloom_contains[i][0];
@@ -692,10 +611,9 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
                 txn_prep+=latencies_txn_prep[i][0];
                 txn_prep_num+=latencies_txn_prep[i][1];
             }
-            printf("RW lookup found\t%lf\t%lf\n", (rw_lookup_found / rw_lookup_found_num) * 1000.0, rw_lookup_found_num);
-            printf("RW lookup not found\t%lf\t%lf\n", (rw_lookup_not_found / rw_lookup_not_found_num) * 1000.0, rw_lookup_not_found_num);
-            printf("compacted lookup\t%lf\t%lf\n", (compacted_lookup / compacted_lookup_num) * 1000.0, compacted_lookup_num);
-            printf("RW insert\t%lf\t%lf\n", (rw_insert / rw_insert_num) * 1000.0, rw_insert_num);
+            printf("lookup found\t%lf\t%lf\n", (lookup_found / lookup_found_num) * 1000.0, lookup_found_num);
+            printf("lookup not found\t%lf\t%lf\n", (lookup_not_found / lookup_not_found_num) * 1000.0, lookup_not_found_num);
+            printf("insert\t%lf\t%lf\n", (insert / insert_num) * 1000.0, insert_num);
             printf("bloom contains\t%lf\t%lf\n", (bloom_contains / bloom_contains_num) * 1000.0, bloom_contains_num);
             printf("bloom insert\t%lf\t%lf\n", (bloom_insert / bloom_insert_num) * 1000.0, bloom_insert_num);
             printf("commit\t%lf\t%lf\n", (commit / commit_num) * 1000.0, commit_num);
@@ -704,120 +622,120 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
     #if MEASURE_LATENCIES == 2
         
         const unsigned nbuckets = 20;
-        unsigned rw_found_buckets[nbuckets];
-        unsigned rw_not_found_buckets[nbuckets];
-        bzero(rw_found_buckets, nbuckets * sizeof(unsigned));
-        bzero(rw_not_found_buckets, nbuckets * sizeof(unsigned));
+        unsigned found_buckets[nbuckets];
+        unsigned not_found_buckets[nbuckets];
+        bzero(found_buckets, nbuckets * sizeof(unsigned));
+        bzero(not_found_buckets, nbuckets * sizeof(unsigned));
         int min_found=INT_MAX, min_not_found=INT_MAX, max_found=0, max_not_found=0;
         #if MEASURE_WITH_STEADY_STATE == 1
-        int rw_found_measurements_num=0, rw_not_found_measurements_num=0;
-        std::list<int>rw_found_list;
-        std::list<int>rw_not_found_list;
+        int found_measurements_num=0, not_found_measurements_num=0;
+        std::list<int>found_list;
+        std::list<int>not_found_list;
         #endif
         for(unsigned t=0; t<N_THREADS; t++){
             for(unsigned i=0; i<ops_per_thread; i++){
                 //found
-                if(latencies_raw_rw_lookup_found[t][i] > 0 && latencies_raw_rw_lookup_found[t][i] < min_found)
-                    min_found = latencies_raw_rw_lookup_found[t][i];
-                if(latencies_raw_rw_lookup_found[t][i] > 0 && latencies_raw_rw_lookup_found[t][i] > max_found)
-                    max_found = latencies_raw_rw_lookup_found[t][i];
+                if(latencies_raw_lookup_found[t][i] > 0 && latencies_raw_lookup_found[t][i] < min_found)
+                    min_found = latencies_raw_lookup_found[t][i];
+                if(latencies_raw_lookup_found[t][i] > 0 && latencies_raw_lookup_found[t][i] > max_found)
+                    max_found = latencies_raw_lookup_found[t][i];
                 #if MEASURE_WITH_STEADY_STATE == 1
-                if(latencies_raw_rw_lookup_found[t][i] > 0){
-                    rw_found_measurements_num++;
-                    rw_found_list.push_back(latencies_raw_rw_lookup_found[t][i]);
+                if(latencies_raw_lookup_found[t][i] > 0){
+                    found_measurements_num++;
+                    found_list.push_back(latencies_raw_lookup_found[t][i]);
                 }
                 #endif
                 //not found
-                if(latencies_raw_rw_lookup_not_found[t][i] > 0 && latencies_raw_rw_lookup_not_found[t][i] < min_not_found)
-                      min_not_found = latencies_raw_rw_lookup_not_found[t][i];
-                if(latencies_raw_rw_lookup_not_found[t][i] > 0 && latencies_raw_rw_lookup_not_found[t][i] > max_not_found)
-                      max_not_found = latencies_raw_rw_lookup_not_found[t][i];
+                if(latencies_raw_lookup_not_found[t][i] > 0 && latencies_raw_lookup_not_found[t][i] < min_not_found)
+                      min_not_found = latencies_raw_lookup_not_found[t][i];
+                if(latencies_raw_lookup_not_found[t][i] > 0 && latencies_raw_lookup_not_found[t][i] > max_not_found)
+                      max_not_found = latencies_raw_lookup_not_found[t][i];
                 #if MEASURE_WITH_STEADY_STATE == 1
-                if(latencies_raw_rw_lookup_not_found[t][i] > 0){
-                    rw_not_found_measurements_num++;
-                    rw_not_found_list.push_back(latencies_raw_rw_lookup_not_found[t][i]);
+                if(latencies_raw_lookup_not_found[t][i] > 0){
+                    not_found_measurements_num++;
+                    not_found_list.push_back(latencies_raw_lookup_not_found[t][i]);
                 }
                 #endif
             }
         }
         #if MEASURE_WITH_STEADY_STATE == 1
-            double rw_lookup_found[2], rw_lookup_not_found[2];
-            bzero(rw_lookup_found, 2* sizeof(double));
-            bzero(rw_lookup_not_found, 2* sizeof(double));
+            double lookup_found[2], lookup_not_found[2];
+            bzero(lookup_found, 2* sizeof(double));
+            bzero(lookup_not_found, 2* sizeof(double));
             // calculate for thread 0 for now
             //found
             int i=0;
-            for(auto val : rw_found_list){
-                if(i< rw_found_measurements_num/2){
-                    rw_lookup_found[0]+=(val/1000.0);
+            for(auto val : found_list){
+                if(i< found_measurements_num/2){
+                    lookup_found[0]+=(val/1000.0);
                 }
                 else{
-                    rw_lookup_found[1]+=(val/1000.0);
+                    lookup_found[1]+=(val/1000.0);
                 }
                 i++;
             }
-            rw_lookup_found[0] = 1000.0 * (rw_lookup_found[0] / (rw_found_measurements_num/2));
-            rw_lookup_found[1] = 1000.0 * (rw_lookup_found[1] / (rw_found_measurements_num/2));
+            lookup_found[0] = 1000.0 * (lookup_found[0] / (found_measurements_num/2));
+            lookup_found[1] = 1000.0 * (lookup_found[1] / (found_measurements_num/2));
             //not found
             i=0;
-            for(auto val : rw_not_found_list){
-                if(i< rw_not_found_measurements_num/2)
-                    rw_lookup_not_found[0]+=(val/1000.0);
+            for(auto val : not_found_list){
+                if(i< not_found_measurements_num/2)
+                    lookup_not_found[0]+=(val/1000.0);
                 else
-                    rw_lookup_not_found[1]+=(val/1000.0);
+                    lookup_not_found[1]+=(val/1000.0);
                 i++;
             }
-            rw_lookup_not_found[0] = 1000.0 * (rw_lookup_not_found[0] / (rw_not_found_measurements_num/2));
-            rw_lookup_not_found[1] = 1000.0 * (rw_lookup_not_found[1] / (rw_not_found_measurements_num/2));
+            lookup_not_found[0] = 1000.0 * (lookup_not_found[0] / (not_found_measurements_num/2));
+            lookup_not_found[1] = 1000.0 * (lookup_not_found[1] / (not_found_measurements_num/2));
             cout<<"==== STEADY STATE ===="<<endl;
-            printf("RW lookup found total\t%d\n", rw_found_measurements_num);
-            printf("RW lookup found first half\t%.2lf\n",rw_lookup_found[0]);
-            printf("RW lookup found second half\t%.2lf\n",rw_lookup_found[1]);
-            printf("RW lookup not found total\t%d\n",rw_not_found_measurements_num);
-            printf("RW lookup not found first half\t%.2lf\n",rw_lookup_not_found[0]);
-            printf("RW lookup not found second half\t%.2lf\n",rw_lookup_not_found[1]);
+            printf("lookup found total\t%d\n", found_measurements_num);
+            printf("lookup found first half\t%.2lf\n",lookup_found[0]);
+            printf("lookup found second half\t%.2lf\n",lookup_found[1]);
+            printf("lookup not found total\t%d\n",not_found_measurements_num);
+            printf("lookup not found first half\t%.2lf\n",lookup_not_found[0]);
+            printf("lookup not found second half\t%.2lf\n",lookup_not_found[1]);
         #endif
         bool calculate_found=false, calculate_not_found=false;
         if(min_found < max_found)
             calculate_found = true;
         if(min_not_found <max_not_found)
             calculate_not_found = true;
-        unsigned rw_found_bucket_size = (max_found - min_found) / nbuckets;
-        unsigned rw_not_found_bucket_size = (max_not_found - min_not_found) / nbuckets;
+        unsigned found_bucket_size = (max_found - min_found) / nbuckets;
+        unsigned not_found_bucket_size = (max_not_found - min_not_found) / nbuckets;
         // scale to exclude the outliers
-        max_found = rw_found_bucket_size/20;
+        max_found = found_bucket_size/20;
         max_not_found = rw_not_found_bucket_size/20;
-        rw_found_bucket_size = (max_found - min_found) / nbuckets;
-        rw_not_found_bucket_size = (max_not_found - min_not_found) / nbuckets;
+        found_bucket_size = (max_found - min_found) / nbuckets;
+        not_found_bucket_size = (max_not_found - min_not_found) / nbuckets;
         // iterate again to create histogram
         for(unsigned t=0; t<N_THREADS; t++){
             for(unsigned i=0; i<ops_per_thread; i++){
-                if(calculate_found && latencies_raw_rw_lookup_found[t][i] > 0 && latencies_raw_rw_lookup_found[t][i] <= max_found)
-                    rw_found_buckets[latencies_raw_rw_lookup_found[t][i]< max_found?  ((latencies_raw_rw_lookup_found[t][i] - min_found) / rw_found_bucket_size) : ((latencies_raw_rw_lookup_found[t][i] - min_found) / rw_found_bucket_size) -1]+=1;
-                if(calculate_not_found && latencies_raw_rw_lookup_not_found[t][i] > 0 && latencies_raw_rw_lookup_not_found[t][i] <= max_not_found)
-                     rw_not_found_buckets[latencies_raw_rw_lookup_not_found[t][i]< max_not_found?  ((latencies_raw_rw_lookup_not_found[t][i] - min_not_found) / rw_not_found_bucket_size) : ((latencies_raw_rw_lookup_not_found[t][i] - min_not_found) / rw_not_found_bucket_size) -1]+=1;
+                if(calculate_found && latencies_raw_lookup_found[t][i] > 0 && latencies_raw_lookup_found[t][i] <= max_found)
+                    found_buckets[latencies_raw_lookup_found[t][i]< max_found?  ((latencies_raw_lookup_found[t][i] - min_found) / found_bucket_size) : ((latencies_raw_lookup_found[t][i] - min_found) / found_bucket_size) -1]+=1;
+                if(calculate_not_found && latencies_raw_lookup_not_found[t][i] > 0 && latencies_raw_lookup_not_found[t][i] <= max_not_found)
+                     not_found_buckets[latencies_raw_lookup_not_found[t][i]< max_not_found?  ((latencies_raw_lookup_not_found[t][i] - min_not_found) / not_found_bucket_size) : ((latencies_raw_lookup_not_found[t][i] - min_not_found) / not_found_bucket_size) -1]+=1;
             }
         }
         cout<<"Min found: "<<min_found<<", min not found: "<<min_not_found<<endl;
         cout<<"Max found: "<<max_found<<", max not found: "<<max_not_found<<endl;
-        unsigned rw_found_all=0, rw_not_found_all=0;
+        unsigned found_all=0, not_found_all=0;
         if(calculate_found || calculate_not_found){
-            // calculate the total latencies (it is different than latencies_rw_lookup_found because we scaled and excluded the outliers)
+            // calculate the total latencies (it is different than latencies_lookup_found because we scaled and excluded the outliers)
             for(unsigned i=0; i<nbuckets; i++){
-                rw_found_all+=rw_found_buckets[i];
-                rw_not_found_all+=rw_not_found_buckets[i];
+                found_all+=found_buckets[i];
+                not_found_all+=not_found_buckets[i];
             }
         }
         if(calculate_found){
-            cout<<"--- RW lookup found --- bucket size: " << rw_found_bucket_size <<"\n";
+            cout<<"--- lookup found --- bucket size: " << found_bucket_size <<"\n";
             for(unsigned i=0; i<nbuckets; i++){
-                cout<< "["<<(i*rw_found_bucket_size) << ", "<< ((i*rw_found_bucket_size) + rw_found_bucket_size)<<")" <<"\t" << rw_found_buckets[i]<< "\t" <<  ((float)rw_found_buckets[i]/rw_found_all) <<endl;
+                cout<< "["<<(i*found_bucket_size) << ", "<< ((i*found_bucket_size) + found_bucket_size)<<")" <<"\t" << found_buckets[i]<< "\t" <<  ((float)found_buckets[i]/found_all) <<endl;
             }
         }
         if(calculate_not_found){
-            cout<<"--- RW lookup not found --- bucket size: " << rw_not_found_bucket_size <<"\n";
+            cout<<"--- lookup not found --- bucket size: " << not_found_bucket_size <<"\n";
             for(unsigned i=0; i<nbuckets; i++){
-                cout<< "["<<(i*rw_not_found_bucket_size) << ", "<< ((i*rw_not_found_bucket_size) + rw_not_found_bucket_size)<<")" <<"\t" << rw_not_found_buckets[i] <<"\t" << ((float)rw_not_found_buckets[i]/rw_not_found_all) <<endl;
+                cout<< "["<<(i*not_found_bucket_size) << ", "<< ((i*not_found_bucket_size) + not_found_bucket_size)<<")" <<"\t" << not_found_buckets[i] <<"\t" << ((float)not_found_buckets[i]/not_found_all) <<endl;
             }
         }
     #endif
@@ -844,80 +762,12 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
     }
 
     #if MEASURE_TREE_SIZE == 1
-    cout<<"RW size: "<< (double)hART.getTARTSize() / 1024 / 1024 <<endl;
+    cout<<"ART size: "<< (double)eART.getTARTSize() / 1024 / 1024 << "MB" <<endl;
     #endif
 
-    hART.merge();
-
     #if REMOVE
-	// Remove R/W
+	// Remove
 	{ 
-        rw_size = rw_size > num_keys ? num_keys : rw_size;
-        bool transactional = ops_per_txn > 0;
-        uint64_t total_txns=0;
-        /* Make sure that main thread has CPU 0. */
-        cpu_set_t cpu_set;
-        CPU_ZERO(&cpu_set);
-        CPU_SET(CPUS[0], &cpu_set);
-        int ret = sched_setaffinity(0, sizeof(cpu_set_t), &cpu_set);
-        if(ret!=0)
-            cout<<"Error setting affinity for main thread!\n";
-        {
-            uint64_t partition_size = rw_size / N_THREADS;
-            auto starttime = std::chrono::system_clock::now();
-            if(multithreaded && ! transactional){
-                /*start_threads(1, rw_size, num_keys, rw_size, Operation::remove_rw, 0);
-                uint64_t ind_start = (thread_pool_sz)* partition_size +1;
-                uint64_t ind_end = rw_size+1;
-                remove_partition(0, 0, ind_start, ind_end, true);
-                for(unsigned i=0; i<thread_pool_sz; i++)
-                    thread_pool[i].join();
-                */
-            }
-            else if (multithreaded && transactional){
-                start_threads(1, rw_size, num_keys, rw_size, Operation::remove_rw, ops_per_txn);
-                uint64_t ind_start = (thread_pool_sz)* partition_size +1;
-                uint64_t ind_end = rw_size+1;
-                remove_partition(ops_per_txn, 0, ind_start, ind_end, true);
-                for(unsigned i=0; i<thread_pool_sz; i++)
-                    thread_pool[i].join();
-            }
-            /*else if (!multithreaded && !transactional){
-                auto t1 = tree_rw.getThreadInfo();
-                for(uint64_t i=1; i<=rw_size; i++){
-                    do_remove(0, i, tree_rw, tart_rw, t1, false);
-                }
-            }
-            else if (!multithreaded && transactional){
-                unsigned ind=0;
-                for (uint64_t i=1; i<= rw_size / ops_per_txn; i++){
-                    GUARDED {
-                        for(uint64_t j=1; j<=ops_per_txn; j++){
-                            ind = (i-1)*ops_per_txn + j;
-                            do_remove(0, ind, true);
-                        }
-                    }
-                    total_txns++;
-                }
-                GUARDED {
-                    uint64_t limit = rw_size % ops_per_txn;
-                    for(uint64_t j=1; j<=limit; j++) { // remove the rest of the keys! (mod)
-                        ind++;
-                        do_remove(0, ind, true);
-                }
-                if(limit>=1)
-                    total_txns++;
-                }
-            }*/
-            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::system_clock::now() - starttime);
-            printf("remove R/W,%ld,%f\n", num_keys-rw_size+2, ((num_keys-rw_size+2) * 1.0) / duration.count());
-	    }
-    }
-
-    // Remove compacted
-    {
-        rw_size = rw_size > num_keys ? num_keys : rw_size;
         bool transactional = ops_per_txn > 0;
         //uint64_t total_txns=0;
         /* Make sure that main thread has CPU 0. */
@@ -928,64 +778,63 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
         if(ret!=0)
             cout<<"Error setting affinity for main thread!\n";
         {
-            //uint64_t partition_size = rw_size / N_THREADS;
+            uint64_t partition_size = num_keys / N_THREADS;
             auto starttime = std::chrono::system_clock::now();
             if(multithreaded && ! transactional){
-                /*start_threads(rw_size+1, num_keys, num_keys, rw_size, Operation::remove_compacted, 0);
-                uint64_t partition_size = (num_keys - rw_size) / N_THREADS;
-                uint64_t ind_start = thread_pool_sz* partition_size +1;
-                uint64_t ind_end = num_keys+1;
-                remove_partition(0, 0, ind_start, ind_end, false);
+                /*start_threads(1, num_keys, Operation::remove_op, 0);
+                uint64_t ind_start = (thread_pool_sz)* partition_size +1;
+                uint64_t ind_end = rw_size+1;
+                remove_partition(0, 0, ind_start, ind_end);
                 for(unsigned i=0; i<thread_pool_sz; i++)
                     thread_pool[i].join();
                 */
             }
             else if (multithreaded && transactional){
-                start_threads(rw_size+1, num_keys, num_keys, rw_size, Operation::remove_compacted, ops_per_txn);
-                uint64_t partition_size = (num_keys - rw_size) / N_THREADS;
-                uint64_t ind_start = thread_pool_sz* partition_size + rw_size + 1;
+                start_threads(1, num_keys, Operation::remove_op, ops_per_txn);
+                uint64_t ind_start = (thread_pool_sz)* partition_size +1;
                 uint64_t ind_end = num_keys+1;
-                /* cout<<"Thread 0: ["<<ind_start<<", "<<ind_end<<")"<<endl; */
-                remove_partition(ops_per_txn, 0, ind_start, ind_end, false);
+                remove_partition(ops_per_txn, 0, ind_start, ind_end);
                 for(unsigned i=0; i<thread_pool_sz; i++)
                     thread_pool[i].join();
             }
-            /*
-            else if (!multithreaded && !transactional){
-                auto t2 = tree_compacted.getThreadInfo();
-                for(uint64_t i=rw_size+1; i<=num_keys; i++){
-                    do_remove(0, i, tree_compacted, tart_compacted, t2, false);
+            /*else if (!multithreaded && !transactional){
+                auto t1 = tree_rw.getThreadInfo();
+                for(uint64_t i=1; i<=rw_size; i++){
+                    do_remove(0, i, tree_rw, tart_rw, t1);
                 }
             }
             else if (!multithreaded && transactional){
                 unsigned ind=0;
-                for (uint64_t i=1; i<= (num_keys - rw_size) / ops_per_txn; i++){
+                for (uint64_t i=1; i<= rw_size / ops_per_txn; i++){
                     GUARDED {
                         for(uint64_t j=1; j<=ops_per_txn; j++){
-                            ind = rw_size + (i-1)*ops_per_txn + j;
-                            do_remove(0, ind, false);
+                            ind = (i-1)*ops_per_txn + j;
+                            do_remove(0, ind);
                         }
                     }
+                    total_txns++;
                 }
-                uint64_t limit = (num_keys - rw_size) % ops_per_txn;
                 GUARDED {
-                    for(uint64_t j=1; j<=limit; j++) { // insert the rest of the keys! (mod)
+                    uint64_t limit = rw_size % ops_per_txn;
+                    for(uint64_t j=1; j<=limit; j++) { // remove the rest of the keys! (mod)
                         ind++;
-                        do_remove(0, ind, false);
-                    }
+                        do_remove(0, ind);
+                }
+                if(limit>=1)
+                    total_txns++;
                 }
             }*/
             auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::system_clock::now() - starttime);
-            printf("remove compacted,%ld,%f\n", num_keys - rw_size+2, ((num_keys - rw_size +2)* 1.0) / duration.count());
-        }
+            printf("remove,%ld,%f\n", num_keys, (num_keys * 1.0) / duration.count());
+	    }
     }
   
     
     cout<<"Removing newly inserted keys now!\n"<<std::flush; 
     if(!lookups_only){ 
         // Remove newly inserted keys
-        start_threads_mixed(ops_per_txn, 0, new_keys_ind, rw_size, Operation::remove_rw);
+        start_threads_mixed(ops_per_txn, 0, new_keys_ind, Operation::remove_op);
         remove_zipf(ops_per_txn, 0);
         for(unsigned i=0; i<thread_pool_sz; i++)
             thread_pool[i].join();
@@ -995,77 +844,42 @@ void run_bench(uint64_t num_keys, uint64_t rw_size, unsigned insert_ratio, unsig
 }
 
 #if MEASURE_KEY_ACCESSES == 1
-std::unordered_map<uint64_t, uint64_t> rw_lookups_m, ro_lookups_m, off_lookups_m, rw_inserts_m, ro_inserts_m, off_inserts_m;
+std::unordered_map<uint64_t, uint64_t> lookups_m, inserts_m;
 #endif
 
 std::mutex m_lock;
 
-void init_key_accesses(unsigned thread_id, uint64_t rw_size, uint64_t keys_read, bool lookupsOnly, unsigned bucket_size){
-    (void)rw_size;
+void init_key_accesses(unsigned thread_id, uint64_t keys_read, bool lookupsOnly, unsigned bucket_size){
     (void)keys_read;
+    (void)bucket_size;
     srand(time(nullptr));
     uint64_t key_ind_insert = 0, key_ind_lookup = 0;
     for(unsigned i=0; i<ops_per_thread; i++){
-    #if FULL_RANGE_ZIPF == 1 
         if(!lookupsOnly)
             key_ind_insert = (uint64_t) zipf_inserts.nextLong((((double)rand()-1))/RAND_MAX);
         key_ind_lookup = (uint64_t) zipf_lookups.nextLong((((double)rand()-1))/RAND_MAX);
-        //key_ind_lookup = (uint64_t) zipfRO_lookups.nextLong((((double)rand()-1))/RAND_MAX);
-    #elif FULL_RANGE_ZIPF == 2
-        if(!lookupsOnly)
-            key_ind_insert = (i % 2 == 0 ? (uint64_t) zipf_inserts.nextLong((((double)rand()-1))/RAND_MAX) : (uint64_t) zipfRO_inserts.nextLong((((double)rand()-1))/RAND_MAX) );
-        key_ind_lookup = (i % 2 == 0 ? (uint64_t) zipf_lookups.nextLong((((double)rand()-1))/RAND_MAX) : (uint64_t) zipfRO_lookups.nextLong((((double)rand()-1))/RAND_MAX) );
-    #elif FULL_RANGE_ZIPF == 3
-        if(!lookupsOnly)
-            key_ind_insert = (uint64_t) zipfRO_inserts.nextLong((((double)rand()-1))/RAND_MAX);
-        key_ind_lookup = (uint64_t) zipfRO_lookups.nextLong((((double)rand()-1))/RAND_MAX);
-    #endif
         if(!lookupsOnly)
             key_insert_indexes[thread_id][i] = key_ind_insert;
         key_lookup_indexes[thread_id][i] = key_ind_lookup;
         #if MEASURE_KEY_ACCESSES == 1
-        if(key_ind_lookup <= rw_size){
+        m_lock.lock();
+        //the first insert will initialize the counter with zero
+        lookups_m[key_ind_lookup]++;
+        m_lock.unlock();
+        if(!lookupsOnly){
             m_lock.lock();
             //the first insert will initialize the counter with zero
-            rw_lookups_m[key_ind_lookup]++;
+            //rw_inserts_m[key_ind_insert]++;
+            // measure for 1000-sized buckets
+            inserts_m[(key_ind_insert-1)/bucket_size]++;
             m_lock.unlock();
-        }
-        else if(key_ind_lookup <=keys_read){
-            m_lock.lock();
-            ro_lookups_m[key_ind_lookup]++;
-            m_lock.unlock();
-        }
-        else{
-            m_lock.lock();
-            off_lookups_m[key_ind_lookup]++;
-            m_lock.unlock();
-        }
-        if(!lookupsOnly){
-            if(key_ind_insert <= rw_size){
-                m_lock.lock();
-                //the first insert will initialize the counter with zero
-                //rw_inserts_m[key_ind_insert]++;
-                // measure for 1000-sized buckets
-                rw_inserts_m[(key_ind_insert-1)/bucket_size]++;
-                m_lock.unlock();
-            }
-            else if(key_ind_insert <=keys_read){
-                m_lock.lock();
-                ro_inserts_m[key_ind_insert]++;
-                m_lock.unlock();
-            }
-            else{
-                m_lock.lock();
-                off_inserts_m[key_ind_insert]++;
-                m_lock.unlock();
-            }
         }
         #endif
     }
 
 }
 
-uint64_t read_keys_from_file(string file_name, uint64_t key_offset, uint64_t rw_size){
+uint64_t read_keys_from_file(string file_name, uint64_t key_offset, bool init){
     std::ifstream file(file_name);
     std::string line;
     uint64_t keys_read=0;
@@ -1078,7 +892,7 @@ uint64_t read_keys_from_file(string file_name, uint64_t key_offset, uint64_t rw_
                 //keys_read--;
                 //break;
             //}
-            addKeyStr(key_offset + keys_read, line.c_str(), key_offset + keys_read <= rw_size);
+            addKeyStr(key_offset + keys_read, line.c_str(), init);
         }
     }
     return keys_read;
@@ -1090,8 +904,8 @@ int main(int argc, char **argv) {
     extern char *optarg;
 	extern int optopt;
 	char c;
-	bool init_f_set = false, exec_f_set = false, r_w_set = false, multithreaded=false;
-	uint64_t rw_size=0;
+	bool init_f_set = false, exec_f_set = false, multithreaded=false;
+    //uint64_t tree_size=0;
 	unsigned insert_ratio=0, ops_per_txn=0;
     float skew_inserts = 0, skew_lookups=0;
 
@@ -1099,7 +913,6 @@ int main(int argc, char **argv) {
 	{
 		{"init-files", required_argument, NULL, 'f'},
 		{"exec-files", required_argument, NULL, 'e'},
-		{"rw-size", required_argument, NULL, 'r'},
 		{"insert-ratio", required_argument, NULL, 'i'},
 		{"ops-per-txn", required_argument, NULL, 'x'},
         {"ops-per-thread", required_argument, NULL, 't'},
@@ -1110,10 +923,10 @@ int main(int argc, char **argv) {
 	};
 
     #if MEASURE_LATENCIES > 0
-    bzero(latencies_rw_lookup_found, (2*N_THREADS)*sizeof(double));
-    bzero(latencies_rw_lookup_not_found, (2*N_THREADS)*sizeof(double));
-    bzero(latencies_rw_insert, (2*N_THREADS)*sizeof(double));
-    bzero(latencies_rw_remove, (2*N_THREADS)*sizeof(double));
+    bzero(latencies_lookup_found, (2*N_THREADS)*sizeof(double));
+    bzero(latencies_lookup_not_found, (2*N_THREADS)*sizeof(double));
+    bzero(latencies_insert, (2*N_THREADS)*sizeof(double));
+    bzero(latencies_remove, (2*N_THREADS)*sizeof(double));
     bzero(latencies_commit, (2*N_THREADS)* sizeof(double));
     bzero(latencies_bloom_contains, (2*N_THREADS)* sizeof(double));
     bzero(latencies_bloom_insert, (2*N_THREADS)* sizeof(double));
@@ -1129,10 +942,6 @@ int main(int argc, char **argv) {
 			case 'e':
 				sprintf(exec_files, optarg);
 				exec_f_set = true;
-				break;
-			case 'r':
-				rw_size = std::stoul(optarg);
-				r_w_set = true;
 				break;
 			case 'i':
 				insert_ratio = std::stoul(optarg);
@@ -1166,7 +975,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	if(!init_f_set || !r_w_set){
+	if(!init_f_set){
 		fprintf(stderr, "Missing parameters!\n");
 		exit(-1);
 	}
@@ -1180,7 +989,7 @@ int main(int argc, char **argv) {
     cur_file = strtok(init_files, ",");
     while(cur_file != nullptr){
         cout<<"Reading from "<< cur_file<<endl;
-        init_keys_read += read_keys_from_file(cur_file, 0, rw_size);
+        init_keys_read += read_keys_from_file(cur_file, 0, true);
         cur_file = strtok(nullptr, ",");
     }
 
@@ -1188,84 +997,51 @@ int main(int argc, char **argv) {
         cur_file = strtok(exec_files, ",");
         while(cur_file != nullptr){
             cout<<"Reading from "<<cur_file<<endl;
-            exec_keys_read += read_keys_from_file(cur_file, init_keys_read+exec_keys_read, rw_size);
+            exec_keys_read += read_keys_from_file(cur_file, init_keys_read+exec_keys_read, false);
             cur_file = strtok(nullptr, ",");
         }
 	}
 
     cout<<"total keys read:" <<(init_keys_read + exec_keys_read) <<", init keys: "<< init_keys_read << ", exec keys: "<< exec_keys_read <<endl;
-    cout<<"Inserting "<<rw_size<< " in RW\n";
-    cout<<"Inserting "<< init_keys_read - rw_size <<" in RO\n";
     zipf_inserts = ZipfianGenerator(1, init_keys_read+exec_keys_read, skew_inserts);
 	zipf_lookups = ZipfianGenerator(1, init_keys_read+exec_keys_read, skew_lookups);
-    // ask from RO only!
-    //zipfRO_inserts = ZipfianGenerator(rw_size+1, init_keys_read+exec_keys_read, skew_inserts);
-    //zipfRO_lookups = ZipfianGenerator(rw_size+1, init_keys_read+exec_keys_read, skew_lookups);
-    //zipfRW_inserts = ZipfianGenerator(1, rw_size, skew_inserts);
     cout<<"Generated zipf distribution of "<<zipf_inserts.getItems()<<" numbers for inserts\n";
-    //cout<<"Generated zipf distribution of "<<zipfRW_inserts.getItems()<<" numbers for RW inserts\n";
     cout<<"Storing key accesses\n";
     unsigned bucket_size = 100;
     for (unsigned i=0; i<thread_pool_sz; i++){
-        thread_pool[i] = std::thread(init_key_accesses, i+1, rw_size, init_keys_read, insert_ratio == 0, bucket_size);
+        thread_pool[i] = std::thread(init_key_accesses, i+1, init_keys_read, insert_ratio == 0, bucket_size);
     }
-    init_key_accesses(0, rw_size, init_keys_read, insert_ratio == 0, bucket_size);
+    init_key_accesses(0, init_keys_read, insert_ratio == 0, bucket_size);
     for (unsigned i=0; i<thread_pool_sz; i++){
         thread_pool[i].join();
     }
     cout<<"Running bench with insert ratio "<< insert_ratio <<endl;
-    run_bench(init_keys_read, rw_size, insert_ratio, ops_per_txn, init_keys_read+1, multithreaded);
+    run_bench(init_keys_read, insert_ratio, ops_per_txn, init_keys_read+1, multithreaded);
     #if MEASURE_KEY_ACCESSES == 1
     uint64_t rw_lookups=0, ro_lookups=0, off_lookups=0, rw_inserts=0, ro_inserts=0, off_inserts=0;
-    double rw_lookup_freq=0, ro_lookup_freq=0, off_lookup_freq=0, rw_insert_freq=0,  ro_insert_freq=0,  off_insert_freq=0; // count the average frequency of key accesses
-    for(const auto &lookup : rw_lookups_m){
-        rw_lookups += lookup.second;
+    double lookup_freq=0, insert_freq=0; // count the average frequency of key accesses
+    for(const auto &lookup : lookups_m){
+        lookups += lookup.second;
     }    
-    for(const auto &lookup : ro_lookups_m){
-        ro_lookups += lookup.second;
-    }    
+    lookup_freq = lookups_m.size() > 0 ? ((double)lookups / lookups_m.size()) : 0;
 
-    for(const auto &lookup : off_lookups_m){
-        off_lookups += lookup.second;
-    }
-    rw_lookup_freq = rw_lookups_m.size() > 0 ? ((double)rw_lookups / rw_lookups_m.size()) : 0;
-    ro_lookup_freq = ro_lookups_m.size() > 0 ? ((double)ro_lookups / ro_lookups_m.size()) : 0;
-    off_lookup_freq = off_lookups_m.size() > 0 ? ((double)off_lookups / off_lookups_m.size()) : 0;
-
-    cout<<"RW lookups: "<<rw_lookups<<endl;
-    cout<<"RO lookups: "<<ro_lookups<<endl;
-    cout<<"Off lookups: "<<off_lookups<<endl;
-    cout<<"RW avg key lookup frequency: "<<rw_lookup_freq<<endl;
-    cout<<"RO avg key lookup frequency: "<<ro_lookup_freq<<endl;
-    cout<<"Off avg key lookup frequency: "<<off_lookup_freq<<endl;
+    cout<<"Number of lookups: "<<lookups<<endl;
+    cout<<"avg key lookup frequency: "<<lookup_freq<<endl;
     if(insert_ratio>0){
-        /*for(const auto &insert : rw_inserts_m){
-            rw_inserts += insert.second;
-        }*/
-        for(unsigned bucket_num=0; bucket_num < (rw_size / bucket_size); bucket_num++){
-            cout<<"["<< ((bucket_num * bucket_size) +1) << ", "<< ((bucket_num*bucket_size) + bucket_size) <<"]: "<< fixed << setprecision(2)<< (( rw_inserts_m[bucket_num] / (float) (ops_per_thread * N_THREADS) )* 100) <<endl;
+        for(const auto &insert : inserts_m){
+            inserts += insert.second;
         }
-        for(const auto &insert : ro_inserts_m){
-            ro_inserts += insert.second;
-        }
+        //for(unsigned bucket_num=0; bucket_num < ( / bucket_size); bucket_num++){
+        //    cout<<"["<< ((bucket_num * bucket_size) +1) << ", "<< ((bucket_num*bucket_size) + bucket_size) <<"]: "<< fixed << setprecision(2)<< (( rw_inserts_m[bucket_num] / (float) (ops_per_thread * N_THREADS) )* 100) <<endl;
+        //}
+        insert_freq = inserts_m.size() > 0 ? ((double)inserts / inserts_m.size()) : 0;
 
-        for(const auto &insert : off_inserts_m){
-            off_inserts += insert.second;
-        }
-        //rw_insert_freq = rw_inserts_m.size() > 0 ? ((double)rw_inserts / rw_inserts_m.size()) : 0;
-        ro_insert_freq = ro_inserts_m.size() > 0 ? ((double)ro_inserts / ro_inserts_m.size()) : 0;
-        off_insert_freq = off_inserts_m.size() > 0 ? ((double)off_inserts / off_inserts_m.size()) : 0;
-
-        //cout<<"RW inserts: "<<rw_inserts<<endl;
-        cout<<"RO inserts: "<<ro_inserts<<endl;
-        cout<<"Off inserts: "<<off_inserts<<endl;
-        //cout<<"RW avg key insert frequency: "<<rw_insert_freq<<endl;
-        cout<<"RO avg key insert frequency: "<<ro_insert_freq<<endl;
-        cout<<"Off avg key insert frequency: "<<off_insert_freq<<endl;
+        cout<<"inserts: "<<inserts<<endl;
+        cout<<"avg key insert frequency: "<<insert_freq<<endl;
     }
     #endif
-    cout<<"RW Keys total (GB): "<< ((double)rw_key_bytes_total) / 1024 / 1024 / 1024 <<endl;
-    cout<<"RO Keys total (GB): "<< ((double)ro_key_bytes_total) / 1024 / 1024 / 1024 <<endl;
+    cout<<"Keys init (MB): "<< ((double)key_bytes_init) / 1024 / 1024 <<endl;
+    cout<<"Keys exec (MB): "<< ((double)key_bytes_exec) / 1024 / 1024 <<endl;
 	cleanup_keys(init_keys_read + exec_keys_read);
     return 0;
 }
