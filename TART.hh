@@ -237,6 +237,9 @@ public:
         #endif	
 	
         if(t_info->updatedVal > 0){ // it is an update
+            //stringstream ss;
+            //ss<<"Update\n";
+            //cout<<ss.str();
             record* rec = reinterpret_cast<record*>(t_info->prevVal);
             auto item = Sto::item(this, rec);
             if(!rec->valid() && !has_insert(item)){
