@@ -123,7 +123,7 @@ public:
 		version_type version;
 		bool deleted;
 
-		record(const Key& k, const TID v, bool valid):val(v),
+		record(const TID v, bool valid):val(v),
 		// Old STO Does not take a bool argument in version constructor
 		//		version(valid? Sto::initialized_tid(): Sto::initialized_tid() | invalid_bit, !valid), deleted(false) {}
 		version(valid? Sto::initialized_tid(): Sto::initialized_tid() | invalid_bit), deleted(false) {
@@ -274,7 +274,7 @@ public:
 
         // create a poisoned record (invalid bit set) and store the client provided tid
         // the actual tid of the ART node will be the record* (casted to TID)
-		record* rec = new record(k, tid, false);
+		record* rec = new record(tid, false);
 		PRINT_DEBUG("Creating new record %p with key %s\n", rec, keyToStr(k).c_str())
 		auto item = Sto::item(this, rec);
         // add this record in the appropriate node
@@ -301,7 +301,8 @@ public:
 		// Include the +2 version number increment that happens at unlock!!
 		// We cannot update the AVN after unlocking, because a concurrent transaction could alter the version number
 		// and we will not detect it!
-		if(! ns_update_node_AVN(updated_nodes[0], updated_nodes_v[0], updated_nodes[0]->getVersion()+2)) {
+		// also check whether node is migrated! Do not update its AVN if it is!
+		if(!l_n->isMigrated() && (! ns_update_node_AVN(updated_nodes[0], updated_nodes_v[0], updated_nodes[0]->getVersion()+2))) {
 			if(t_info->w_unlock_obsolete)
                 l_n->writeUnlockObsolete();
             else
@@ -367,10 +368,12 @@ public:
 			PRINT_DEBUG("-- Unlocking parent node %p\n", l_p_n);
 			l_p_n->writeUnlock();
 		}
-		if(l_n == n)
+		if(l_n == n){
 			PRINT_DEBUG("We are unlocking the node we just inserted to!! (%p)\n", n)
+        }
 		PRINT_DEBUG(" ==== Now node's %p AVN:%lu\n", n, n->getVersion())
-		//item_tmp = item.item();
+		
+        //item_tmp = item.item();
 		//rec_tmp = item_tmp.key<record*>();
 		//PRINT_DEBUG("Inserted key %s\n", keyToStr(rec_tmp->key).c_str())
         #if MEASURE_TREE_SIZE == 1
@@ -644,7 +647,17 @@ public:
         #if ABSENT_VALIDATION == 1
         if(is_in_nodeset(item)){
 			N* node = get_node(item.key<uintptr_t>());
-			auto live_vers = node->getVersion();
+			if(node->isMigrated() || node->isObsolete(node->getVersion())){ // node migrated or became obsolete in the meantime! Abort!
+                // new: We need to mark node for deletion, if needed! That's when we grow a node to a bigger one and we need to delete the previous one
+                // TODO: might be unsafe to delete at that time! A concurrent transaction could have added this node in the node set and will crash
+                // when trying to access it!
+                //if(node->isMigrated()){
+                //    auto epocheInfo = this->getThreadInfo();
+                //    epocheInfo.getEpoche().markNodeForDeletion(node, epocheInfo);
+                //}
+                return false;
+            }
+            auto live_vers = node->getVersion();
 			auto titem_vers = item.read_value<decltype(node->getVersion())>();
             if(live_vers != titem_vers){
                 PRINT_DEBUG("Node set check: node %p version: %lu, TItem version: %lu\n", node, live_vers, titem_vers)
@@ -833,14 +846,14 @@ public:
 		loadKey(tid, k);
 		ThreadInfo epocheInfo = getThreadInfo();
 		if(committed? has_delete(item) : has_insert(item)){
-			// TODO: might need to check the result of remove (if not found)!Even though we check it earlier in t_remove, it might have been removed later
+			// We check the result of remove (if not found)! Even though we check it earlier in t_remove, it might have been removed later. That's by using the 'shouldAbort' flag
             trans_info* t_info = new trans_info();
             bzero(t_info, sizeof(trans_info));
             remove(k, tid, epocheInfo, t_info);
-			// TODO: Check: this causes segfault in some runs...
+			// Do not call RCU delete when element was actually not deleted (not found). We're ussing the shouldAbort field so that to not include an extra field for 'deleted'
 			if(!t_info->shouldAbort)
                 Transaction::rcu_delete(rec);
-		    delete t_info;
+            delete t_info;
         }
 		item.clear_needs_unlock();
         #if BLOOM_VALIDATE == 1

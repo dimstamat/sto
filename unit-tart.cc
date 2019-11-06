@@ -122,9 +122,14 @@ int main() {
     // lookup range
     Key key_start, key_end, key_cont;
     TID tid_start=7, tid_end=8;
-    loadKey2(tid_start, key_start);
-    loadKey2(tid_end, key_end);
+    //loadKey2(tid_start, key_start);
+    //loadKey2(tid_end, key_end);
 
+    
+    char key_dat [][2] = {{(char)0}, {(char)255}};
+    key_start.set(key_dat[0], (unsigned)1);
+    key_end.set(key_dat[1], (unsigned)1);
+    
     TID result[20];
 
     std::size_t resultsFound;
