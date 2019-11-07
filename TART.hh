@@ -22,7 +22,7 @@ using namespace std;
 
 #define DEBUG 0
 #define DEBUG_VALIDATION 0
-#define MEASURE_ABORTS 0
+#define MEASURE_ABORTS 1
 #define ABSENT_VALIDATION 1 // 1 for node set, 2 for node set with absent keys, 3 for absent keys and lookup starting from target node, 4 for key set
 
 #if DEBUG == 1
