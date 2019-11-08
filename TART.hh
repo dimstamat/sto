@@ -156,6 +156,10 @@ public:
         return 0;
     }
 
+    lookup_res t_lookupRange(const Key& start, const Key& end, Key & continueKey, TID result[], std::size_t resultSize, std::size_t &resultsFound, ThreadInfo &threadEpocheInfo) {
+        bool toContinue = lookupRange(start, end, continueKey, result, resultSize, resultsFound, threadEpocheInfo);
+    }
+
 	lookup_res t_lookup(const Key& k, ThreadInfo& threadEpocheInfo){
 		return t_lookup( k, threadEpocheInfo, true);
 	}
