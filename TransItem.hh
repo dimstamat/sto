@@ -10,7 +10,7 @@
 class TransProxy;
 
 // for bloom filter validation
-#define BLOOM_VALIDATE 2
+#define BLOOM_VALIDATE 0
 
 class TransItem {
   public:
