@@ -22,7 +22,7 @@ using namespace std;
 
 #define DEBUG 0
 #define DEBUG_VALIDATION 0
-#define MEASURE_ABORTS 0
+#define MEASURE_ABORTS 1
 #define ABSENT_VALIDATION 1 // 1 for node set, 2 for node set with absent keys, 3 for absent keys and lookup starting from target node, 4 for key set
 
 #if DEBUG == 1
@@ -115,7 +115,7 @@ public:
     }
 
 	typedef struct record {
-		// TODO: We might not need to store key here!
+		// DONE: We might not need to store key here!
 		// ART itself does not store actual keys, client is responsible for
 		// TID to key mapping. We can find a key by calling loadKey(tid, key); (supplied key is empty and initialized by loadKey)
 		//Key key;
@@ -156,14 +156,46 @@ public:
         return 0;
     }
 
+    lookup_res t_lookupRange(const Key& start, const Key& end, Key & continueKey, TID result[], std::size_t resultSize, std::size_t &resultsFound, ThreadInfo &threadEpocheInfo) {
+        trans_info_range_t* t_info = new trans_info_range_t();
+        memset(t_info, 0, sizeof(trans_info_range_t));
+        // adds a key in the read set
+        t_info->addKeyRS = [this](TID tid){
+            record* rec = reinterpret_cast<record*>(tid);
+            auto item = Sto::item(this, rec);
+            if(!rec->valid() && !has_insert(item)){ // key record is poisoned by a concurrent transaction, abort!
+                INCR(aborts[TThread::id()][4])
+                    return false;
+                }
+                if(has_delete(item)){ // current transaction already marked for deletion, reply as it is absent!
+                    return true;
+                }
+                // add to read set
+                item.observe(rec->version);
+                return true;
+        };
+        // adds a parent node in the node set together with its version number
+        t_info->addNodeNS = [this] (const N* node, uint64_t node_vers){
+            #if ABSENT_VALIDATION == 1
+                ns_add_node(node, node_vers);
+            #endif
+            return true;
+        };
+        bool toContinue = lookupRange(start, end, continueKey, result, resultSize, resultsFound, threadEpocheInfo, t_info);
+        if(t_info->abort){
+            return lookup_res(0, false);
+        }
+        return lookup_res(0, true);
+    }
+
 	lookup_res t_lookup(const Key& k, ThreadInfo& threadEpocheInfo){
 		return t_lookup( k, threadEpocheInfo, true);
 	}
 
 	lookup_res t_lookup(const Key& k, ThreadInfo& threadEpocheInfo, bool validate){
         PRINT_DEBUG("Lookup key %s\n", keyToStr(k).c_str())
-		trans_info* t_info = new trans_info();
-		memset(t_info, 0, sizeof(trans_info));
+		trans_info_t* t_info = new trans_info_t();
+		memset(t_info, 0, sizeof(trans_info_t));
         TID tid = lookup(k, threadEpocheInfo, t_info);
         #if MEASURE_ART_NODE_ACCESSES == 1
         if(validate){
@@ -214,10 +246,10 @@ public:
     
     // ins_res is <inserted, ok-to-commit>, where inserted is true when the new key caused an insertion and false when it was an udpate. ok-to-commit is false when the transaction must abort at run-time.
 	ins_res t_insert(const Key & k, TID tid, ThreadInfo &epocheInfo){
-        trans_info* t_info = new trans_info();
-		memset(t_info, 0, sizeof(trans_info));
+        trans_info_t* t_info = new trans_info_t();
+		memset(t_info, 0, sizeof(trans_info_t));
 		//stringstream ss;
-        //ss<<"Size: "<< sizeof(trans_info)<<endl;
+        //ss<<"Size: "<< sizeof(trans_info_t)<<endl;
         //cout<<ss.str();
         PRINT_DEBUG("Transactionally Inserting (key:%s, tid:%lu)\n", keyToStr(k).c_str(), tid)
 		insert(k, tid, epocheInfo, t_info); 
@@ -237,20 +269,20 @@ public:
         #endif	
 	
         if(t_info->updatedVal > 0){ // it is an update
+            //stringstream ss;
+            //ss<<"Update\n";
+            //cout<<ss.str();
             record* rec = reinterpret_cast<record*>(t_info->prevVal);
             auto item = Sto::item(this, rec);
             if(!rec->valid() && !has_insert(item)){
                 INCR(aborts[TThread::id()][4])
-                if(t_info->w_unlock_obsolete)
-                    l_n->writeUnlockObsolete();
-                else
-                    l_n->writeUnlock();
                 delete t_info;
                 return ins_res(false, false);
             }
+            // UPDATE: We do not need to update AVN in node set as it was an update of existing key and thus AVN didn't change!
             // update AVN in node set, if exists
             // Use the version number after the unlock! (+2)
-            #if ABSENT_VALIDATION == 1
+            /*#if ABSENT_VALIDATION == 1
             if(! ns_update_node_AVN(updated_nodes[0], updated_nodes_v[0], updated_nodes[0]->getVersion()+2)) {
                 PRINT_DEBUG("UPDATE NODE FAIL!\n")
                 INCR(aborts[TThread::id()][5])
@@ -262,12 +294,9 @@ public:
                 return ins_res(false, false);
             }
             #endif
+            */
             item.add_write(t_info->updatedVal);
             // TODO: In some runs l_n was null! Check it!
-            if(t_info->w_unlock_obsolete)
-                l_n->writeUnlockObsolete();
-            else
-                l_n->writeUnlock();
             delete t_info;
             return ins_res(false, true);
         }
@@ -390,8 +419,8 @@ public:
 
 	rem_res t_remove(const Key & k, TID tid, ThreadInfo &threadEpocheInfo){
 		bool tid_mismatch = false;
-		trans_info* t_info = new trans_info();
-		memset(t_info, 0, sizeof(trans_info));
+		trans_info_t* t_info = new trans_info_t();
+		memset(t_info, 0, sizeof(trans_info_t));
         PRINT_DEBUG("Transactionally Removing (key:%s, tid:%lu)\n", keyToStr(k).c_str(), tid)
         TID lookup_tid = lookup(k, threadEpocheInfo, t_info);
         if(t_info->check_key){ // call the TART check Key! (casting from rec*)
@@ -672,8 +701,8 @@ public:
             unsigned i=0;
             while(keys_list!= nullptr){
                 if(keys_list->k != nullptr){
-                    trans_info* t_info = new trans_info();
-                    memset(t_info, 0, sizeof(trans_info));
+                    trans_info_t* t_info = new trans_info_t();
+                    memset(t_info, 0, sizeof(trans_info_t));
                     auto t = this->getThreadInfo();
                     #if ABSENT_VALIDATION == 2
                     TID tid = lookup(*keys_list->k, t, t_info);
@@ -722,8 +751,8 @@ public:
         #elif ABSENT_VALIDATION == 4
         if(is_in_keyset(item)){
             Key *k = get_key(item.key<uintptr_t>());
-            trans_info* t_info = new trans_info();
-            memset(t_info, 0, sizeof(trans_info));
+            trans_info_t* t_info = new trans_info_t();
+            memset(t_info, 0, sizeof(trans_info_t));
             auto t = this->getThreadInfo();
             TID tid = lookup(*k, t, t_info);
             if(t_info->check_key){ // call the TART check Key! (casting from rec*)
@@ -847,8 +876,8 @@ public:
 		ThreadInfo epocheInfo = getThreadInfo();
 		if(committed? has_delete(item) : has_insert(item)){
 			// We check the result of remove (if not found)! Even though we check it earlier in t_remove, it might have been removed later. That's by using the 'shouldAbort' flag
-            trans_info* t_info = new trans_info();
-            bzero(t_info, sizeof(trans_info));
+            trans_info_t* t_info = new trans_info_t();
+            bzero(t_info, sizeof(trans_info_t));
             remove(k, tid, epocheInfo, t_info);
 			// Do not call RCU delete when element was actually not deleted (not found). We're ussing the shouldAbort field so that to not include an extra field for 'deleted'
 			if(!t_info->shouldAbort)
