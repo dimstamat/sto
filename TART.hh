@@ -69,10 +69,7 @@ typedef struct absent_keys {
 }absent_keys_t;
 #endif
 
-// forward declared, definition in util/bloom.hh
-class DoubleLookup;
-
-template <typename T, typename BloomT, typename W = TWrapped<T>>
+template <typename T, typename W = TWrapped<T>>
 class TART : public Tree, TObject {
 
 	typedef typename W::version_type version_type;
@@ -82,23 +79,11 @@ class TART : public Tree, TObject {
 	static constexpr TransItem::flags_type delete_bit = TransItem::user0_bit << 1;
 
 	static constexpr uintptr_t nodeset_bit = 1LU << 63;
-    static constexpr uintptr_t bloom_validation_bit = 1LU << 62;
-    static constexpr uintptr_t keyset_bit = 1LU <<61;
-
-    bool compacted=false;
-
-    BloomT & bloom;
-
-    inline bool is_using_bloom(){
-        return ! std::is_same<BloomT, DoubleLookup>::value;
-    }
+    static constexpr uintptr_t keyset_bit = 1LU <<62;
 
 public:
 
-    TART(LoadKeyFunction loadKeyFun, BloomT& b) : TART(loadKeyFun, b, false) {
-    }
-
-	TART(LoadKeyFunction loadKeyFun, BloomT& b, bool comp) : Tree(loadKeyFun), compacted(comp), bloom(b) {
+	TART(LoadKeyFunction loadKeyFun) : Tree(loadKeyFun) {
         #if MEASURE_ABORTS == 1
             bzero(aborts, N_THREADS * aborts_sz * sizeof(uint64_t));
             aborts_descr[0] = "nodeset validation failure";
@@ -279,7 +264,7 @@ public:
                 delete t_info;
                 return ins_res(false, false);
             }
-            // UPDATE: We do not need to update AVN in node set as it was an update and thus AVN didn't change!
+            // UPDATE: We do not need to update AVN in node set as it was an update of existing key and thus AVN didn't change!
             // update AVN in node set, if exists
             // Use the version number after the unlock! (+2)
             /*#if ABSENT_VALIDATION == 1
@@ -461,55 +446,7 @@ public:
 		return rem_res(true, true);
 	}
 
-    #if BLOOM_VALIDATE == 1
-    // for BLOOM_VALIDATE 1
-    // add in a separate data structure! Performance is bad when we create a Sto::item per absent bloom filter element
-    void bloom_v_add_hash_key(uint64_t* hashVal){
-        /*if (( reinterpret_cast<uintptr_t>(hashVal) & bloom_validation_bit ) != 0){
-            cout<<"Oops, 62nd bit is set!\n";
-            cout<<"Oops, hashVal is "<<hashVal<<endl;
-        }
-        if (( reinterpret_cast<uintptr_t>(hashVal) & nodeset_bit) != 0)
-            cout<<"Oops, 63rd bit is set!\n";*/
-        auto item = Sto::item(this, get_bloomset_hash_key(hashVal));
-        if(!item.has_read()){
-            item.add_read(0);
-        }
-    }
-    #elif BLOOM_VALIDATE == 2
-    // for BLOOM_VALIDATE 2
-    void bloom_v_add_key(TID tid, uint64_t* hashVal){
-        INIT_COUNTING_BLOOM
-        auto item = Sto::item(this, get_bloomset_key(tid));
-        if(!item.has_read()){
-            item.add_read(0);
-            START_COUNTING_BLOOM
-            memcpy(item.item().hashValue, hashVal, 2 * sizeof(uint64_t));
-            STOP_COUNTING_BLOOM("memcpy in TItem")
-        }
-    }
-    #endif
     private:
-    #if BLOOM_VALIDATE == 1
-    // for BLOOM_VALIDATE 1
-    uintptr_t get_bloomset_hash_key(uint64_t* hashVal){
-        return reinterpret_cast<uintptr_t>(hashVal) | bloom_validation_bit;
-    }
-    uint64_t* get_bloomset_hash_val(uintptr_t b){
-        return reinterpret_cast<uint64_t*>(b & ~bloom_validation_bit);
-    }
-    #elif BLOOM_VALIDATE == 2
-    // for BLOOM_VALIDATE 2
-    uintptr_t get_bloomset_key(TID tid){
-        return reinterpret_cast<uintptr_t>(tid) | bloom_validation_bit;
-    }
-    TID get_bloomset_tid(uintptr_t t){
-        return reinterpret_cast<TID>(t & ~bloom_validation_bit);
-    }
-    bool is_in_bloomset(TransItem& item){
-        return (item.key<uintptr_t>() & bloom_validation_bit) != 0;
-    }
-    #endif
 
     // For ABSENT_VALIDATION 1
 	#if ABSENT_VALIDATION == 1
@@ -773,33 +710,6 @@ public:
             return true;
         }
         #endif
-        #if BLOOM_VALIDATE > 0
-        if(is_using_bloom()){  // it's a compile-time check
-            if(is_in_bloomset(item)){
-                INIT_COUNTING_BLOOM
-                uint64_t* hash;
-                #if BLOOM_VALIDATE == 1
-                hash = get_bloomset_hash_val(item.key<uintptr_t>());
-                #elif BLOOM_VALIDATE == 2
-                //TID key = get_bloomset_key(item.key<uintptr_t>());
-                START_COUNTING_BLOOM
-                hash = item.hashValue;
-                STOP_COUNTING_BLOOM("get hashValue from TItem")
-                #endif
-                //TID tid = get_tid(item.key<uintptr_t>());
-                //Key k;
-                //uintptr_t tid_flagged = reinterpret_cast<uintptr_t>(tid | dont_cast_from_rec_bit);
-                //loadKey(reinterpret_cast<TID>(tid_flagged), k);
-                if(bloom.contains_hash(hash)){
-                //if(bloom.contains(k.getKey(), k.getKeyLen(), nullptr)){
-                    PRINT_DEBUG_VALIDATION("VALIDATION FAILED: BLOOMSET\n");
-                    INCR(aborts[TThread::id()][1])
-                    return false;
-                }
-                return true;
-            }
-        }
-        #endif
         record* rec = item.key<record*>();
         //assert(txn.threadid() == TThread::id());
         okay = item.check_version(rec->version);
@@ -885,14 +795,6 @@ public:
             delete t_info;
         }
 		item.clear_needs_unlock();
-        #if BLOOM_VALIDATE == 1
-        if(is_using_bloom()) { // it's a compile-time check
-            if(is_in_bloomset(item)){
-                uint64_t* hashVal = get_bloomset_hash_val(item.key<uintptr_t>());
-                delete hashVal;
-            }
-        }
-        #endif
     }
 };
 
